@@ -12,6 +12,8 @@
 #include "lsp_completion.h"
 #include "lsp_hover.h"
 #include "lsp_definition.h"
+#include "lsp_semantic.h"
+#include "lsp_references.h"
 #include "lsp_symbols.h"
 #include "lsp_code_action.h"
 #include "json.h"
@@ -196,6 +198,22 @@ int main(int argc, char **argv) {
             jb_kv_int(&res, "textDocumentSync", (int)LSP_SYNC_FULL);
             jb_kv_bool(&res, "hoverProvider", true);
             jb_kv_bool(&res, "definitionProvider", true);
+            jb_kv_bool(&res, "referencesProvider", true);
+            jb_kv_bool(&res, "implementationProvider", true);
+            jb_key(&res, "semanticTokensProvider");
+            jb_start_obj(&res);
+            jb_key(&res, "legend"); jb_start_obj(&res);
+            jb_key(&res, "tokenTypes"); jb_start_arr(&res);
+            jb_str(&res, "namespace"); jb_str(&res, "type"); jb_str(&res, "class");
+            jb_str(&res, "enum"); jb_str(&res, "interface"); jb_str(&res, "struct");
+            jb_str(&res, "typeParameter"); jb_str(&res, "parameter"); jb_str(&res, "variable");
+            jb_str(&res, "property"); jb_str(&res, "enumMember"); jb_str(&res, "event");
+            jb_str(&res, "function"); jb_str(&res, "method"); jb_str(&res, "macro");
+            jb_str(&res, "keyword"); jb_str(&res, "modifier"); jb_str(&res, "comment");
+            jb_str(&res, "string"); jb_str(&res, "number"); jb_str(&res, "regexp");
+            jb_str(&res, "operator"); jb_str(&res, "decorator"); jb_end_arr(&res);
+            jb_key(&res, "tokenModifiers"); jb_start_arr(&res); jb_end_arr(&res);
+            jb_end_obj(&res); jb_kv_bool(&res, "full", true); jb_kv_bool(&res, "range", false); jb_end_obj(&res);
             jb_kv_bool(&res, "documentSymbolProvider", true);
             jb_kv_bool(&res, "codeActionProvider", true);
 
@@ -337,6 +355,25 @@ int main(int argc, char **argv) {
             } else {
                 send_response(&transport, id, NULL, true);
             }
+        } else if (strcmp(method, "textDocument/references") == 0 ||
+                   strcmp(method, "textDocument/implementation") == 0) {
+            const JsonVal *td = json_get_obj(params, "textDocument");
+            const JsonVal *po = json_get_obj(params, "position");
+            if (td && po) {
+                LspDocument *doc = lsp_docstore_get(&doc_store, json_get_str(td, "uri", ""));
+                LspPosition pos = {(uint32_t)json_get_int(po, "line", 0), (uint32_t)json_get_int(po, "character", 0)};
+                char *res_json = strcmp(method, "textDocument/references") == 0
+                    ? lsp_references_query(&engine, &doc_store, doc, pos)
+                    : lsp_implementation_query(&engine, &doc_store, doc, pos);
+                send_response(&transport, id, res_json, res_json == NULL);
+                if (res_json) free(res_json);
+            } else send_response(&transport, id, "[]", false);
+        } else if (strcmp(method, "textDocument/semanticTokens/full") == 0) {
+            const JsonVal *td = json_get_obj(params, "textDocument");
+            LspDocument *doc = td ? lsp_docstore_get(&doc_store, json_get_str(td, "uri", "")) : NULL;
+            char *res_json = lsp_semantic_tokens_query(&engine, doc);
+            send_response(&transport, id, res_json, res_json == NULL);
+            if (res_json) free(res_json);
         } else if (strcmp(method, "textDocument/documentSymbol") == 0) {
             const JsonVal *td = json_get_obj(params, "textDocument");
             if (td) {
@@ -376,6 +413,7 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(method, "shutdown") == 0) {
             send_response(&transport, id, NULL, true);
+            running = false;
         } else if (strcmp(method, "exit") == 0) {
             running = false;
         } else {

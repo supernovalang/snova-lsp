@@ -157,4 +157,14 @@ typedef struct {
     const char *message;
 } LspDiagnostic;
 
+/* Semantic token data is encoded as LSP relative tuples:
+ * deltaLine, deltaStart, length, tokenType, tokenModifiers. */
+typedef struct {
+    uint32_t line;
+    uint32_t start;
+    uint32_t length;
+    uint32_t type;
+    uint32_t modifiers;
+} LspSemanticToken;
+
 #endif /* SNOVA_LSP_PROTOCOL_H */

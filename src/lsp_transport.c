@@ -48,7 +48,13 @@ static bool read_more(LspTransport *t) {
         t->read_buf = new_buf;
         t->read_buf_cap = new_cap;
     }
-    size_t n = fread(t->read_buf + t->read_buf_len, 1, t->read_buf_cap - t->read_buf_len, t->in);
+    /*
+     * stdin is normally a pipe. Reading the whole free buffer with fread can
+     * wait for that many bytes on some C runtimes, delaying small JSON-RPC
+     * requests (notably initialize) until the client times out. Read one byte
+     * at a time so the framing loop can process partial pipe input promptly.
+     */
+    size_t n = fread(t->read_buf + t->read_buf_len, 1, 1, t->in);
     if (n == 0) {
         return false;
     }

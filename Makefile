@@ -12,28 +12,38 @@ INCLUDES = -Isrc -I$(SNOVAC_DIR)
 
 ifeq ($(OS),Windows_NT)
   EXE := .exe
+  BIN_DIR := tools/bin
 else
   EXE :=
+  BIN_DIR := $(BUILD)
 endif
 
-BIN = $(BUILD)/snova-lsp$(EXE)
+BIN = $(BIN_DIR)/snova-lsp$(EXE)
 TEST_BIN = $(BUILD)/test_completion$(EXE)
 
 SRCS = src/json.c src/lsp_transport.c src/lsp_document.c src/lsp_analysis.c \
        src/lsp_definition.c src/lsp_hover.c src/lsp_symbols.c src/lsp_completion.c \
-       src/lsp_code_action.c src/main.c
+       src/lsp_code_action.c src/lsp_semantic.c src/lsp_references.c src/main.c
 
 OBJS = $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: all clean test install
+.PHONY: all rebuild clean test install
 
 all: $(BIN)
 
+rebuild:
+	$(MAKE) clean
+	$(MAKE) all
+
 $(BUILD):
-	mkdir -p $(BUILD)
+	mkdir $(BUILD)
+
+$(BIN_DIR):
+	if not exist tools mkdir tools
+	if not exist tools\bin mkdir tools\bin
 
 $(SNOVAC_LIB):
 	$(MAKE) -C $(SNOVAC_DIR) all
@@ -41,7 +51,7 @@ $(SNOVAC_LIB):
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(INCLUDES) -c -o $@ $<
 
-$(BIN): $(OBJS) $(SNOVAC_LIB)
+$(BIN): $(OBJS) $(SNOVAC_LIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(SNOVAC_CHECK_OBJ) $(SNOVAC_LIB)
 
 $(TEST_BIN): tests/test_completion.c $(filter-out $(BUILD)/main.o,$(OBJS)) $(SNOVAC_LIB) | $(BUILD)

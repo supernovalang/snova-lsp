@@ -5,6 +5,9 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "lsp_analysis.h"
 #include <stdlib.h>
 #include <string.h>
@@ -277,10 +280,11 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
     sn_intern_init(&a->intern, &a->arena);
     diag_list_init(&a->diags);
 
-    // Setup in-memory stream for diagnostics
+    // Use a temporary stream so the LSP remains portable to C runtimes that
+    // do not provide the GNU-only open_memstream extension.
     char *diag_buf = NULL;
     size_t diag_size = 0;
-    FILE *diag_mem = open_memstream(&diag_buf, &diag_size);
+    FILE *diag_mem = tmpfile();
 
     sn_diag_init(&a->diag, a->path ? a->path : "", doc->text, doc->text_len);
     a->diag.out = diag_mem;
@@ -350,7 +354,21 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
     check_all_bodies(&a->checker, &a->resolver, &a->graph, &a->arena, &scope);
 
     // Close and flush diagnostics
-    fclose(diag_mem);
+    if (diag_mem) {
+        long end = ftell(diag_mem);
+        if (end > 0) {
+            diag_size = (size_t)end;
+            diag_buf = (char *)malloc(diag_size + 1);
+            if (diag_buf) {
+                rewind(diag_mem);
+                diag_size = fread(diag_buf, 1, diag_size, diag_mem);
+                diag_buf[diag_size] = '\0';
+            } else {
+                diag_size = 0;
+            }
+        }
+        fclose(diag_mem);
+    }
     a->diag.out = NULL;
     a->diag.quiet = 1;
     if (diag_buf && diag_size > 0) {
@@ -657,6 +675,14 @@ const SnSymbol *lsp_find_symbol_at(const LspDocAnalysis *a, const LspDocument *d
     for (size_t i = 0; i < a->unit.imports.len; i++) {
         const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
         SnScope *imp_scope = sn_resolver_package_scope(&a->resolver, imp);
+        char package_name[SNOVAC_PATH_MAX];
+        if (!imp_scope && imp) {
+            snprintf(package_name, sizeof(package_name), "%s", imp);
+            for (char *dot = strrchr(package_name, '.'); dot && !imp_scope; dot = strrchr(package_name, '.')) {
+                *dot = '\0';
+                imp_scope = sn_resolver_package_scope(&a->resolver, package_name);
+            }
+        }
         if (imp_scope) {
             SnSymbol *s = sn_scope_lookup(imp_scope, iname);
             if (s) return s;
@@ -821,4 +847,3 @@ LspDocAnalysis *lsp_engine_analyze_manifest(LspAnalysisEngine *engine, const Lsp
     engine->analyses = a;
     return a;
 }
-

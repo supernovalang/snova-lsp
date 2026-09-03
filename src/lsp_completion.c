@@ -128,6 +128,18 @@ static bool subsequence_matches(const char *label, const char *prefix) {
     return (pi == plen);
 }
 
+static bool case_insensitive_contains(const char *text, const char *needle) {
+    if (!text || !needle || !needle[0]) return false;
+    size_t n = strlen(needle);
+    for (const char *p = text; *p; p++) {
+        size_t i = 0;
+        while (i < n && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == n) return true;
+    }
+    return false;
+}
+
 static int compute_match_bonus(const char *label, const char *prefix) {
     if (!prefix || !prefix[0]) return 0;
     if (!label) return -1;
@@ -153,7 +165,7 @@ static int compute_match_bonus(const char *label, const char *prefix) {
     if (subsequence_matches(label, prefix)) return 20;
 
     // Tier 7: Substring match
-    if (strcasestr(label, prefix) != NULL) return 15;
+    if (case_insensitive_contains(label, prefix)) return 15;
 
     return -1;
 }
@@ -485,6 +497,8 @@ static void add_keywords_and_snippets(CompList *list, ComplContext ctx, bool has
     complist_add(list, "async", LSP_COMPLETION_KEYWORD, "keyword", "Async function modifier", "async func ", 1, NULL, 40, 0);
     complist_add(list, "await", LSP_COMPLETION_KEYWORD, "keyword", "Await async future expression", "await ", 1, NULL, 40, 0);
     complist_add(list, "pulsar", LSP_COMPLETION_KEYWORD, "keyword", "Pulsar actor / task modifier", "pulsar ", 1, NULL, 40, 0);
+    complist_add(list, "pulsar func", LSP_COMPLETION_SNIPPET, "pulsar function", "Declares a Pulsar function that can participate in asynchronous streams", "pulsar func ${1:name}(${2:params}): ${3:unit} {\n\t$0\n}", 2, NULL, 52, 0);
+    complist_add(list, "pulsar method", LSP_COMPLETION_SNIPPET, "pulsar method", "Declares a Pulsar method on the current type", "pulsar method ${1:name}(${2:params}): ${3:unit} {\n\t$0\n}", 2, NULL, 52, 0);
     complist_add(list, "try", LSP_COMPLETION_SNIPPET, "snippet", "Try-catch block", "try {\n\t${1:/* work */}\n} catch (e: Error) {\n\t$0\n}", 2, NULL, 40, 0);
     complist_add(list, "throw", LSP_COMPLETION_KEYWORD, "keyword", "Throw error statement", "throw ${1:error};", 2, NULL, 40, 0);
     complist_add(list, "defer", LSP_COMPLETION_SNIPPET, "snippet", "Defer cleanup block", "defer {\n\t$0\n}", 2, NULL, 40, 0);
@@ -727,6 +741,20 @@ static void add_scope_symbols(CompList *list, SnScope *scope, ComplContext ctx, 
     }
 }
 
+static SnScope *completion_import_scope(const LspDocAnalysis *a, const char *imp) {
+    if (!a || !imp) return NULL;
+    SnScope *scope = sn_resolver_package_scope(&a->resolver, imp);
+    if (scope) return scope;
+    char prefix[SNOVAC_PATH_MAX];
+    snprintf(prefix, sizeof(prefix), "%s", imp);
+    for (char *p = strrchr(prefix, '.'); p; p = strrchr(prefix, '.')) {
+        *p = '\0';
+        scope = sn_resolver_package_scope(&a->resolver, prefix);
+        if (scope) return scope;
+    }
+    return NULL;
+}
+
 /* ── Member Completion on Inferred Type ───────────────────────────────────── */
 
 static void add_members_for_typerep(CompList *list, const LspDocAnalysis *a, const SnTypeRep *ty, bool has_following_paren) {
@@ -918,7 +946,7 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
 
             for (size_t i = 0; i < a->unit.imports.len; i++) {
                 const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
-                SnScope *imp_scope = sn_resolver_package_scope(&a->resolver, imp);
+                SnScope *imp_scope = completion_import_scope(a, imp);
                 if (imp_scope) {
                     add_scope_symbols(&list, imp_scope, ctx, 75, has_following_paren);
                 }
