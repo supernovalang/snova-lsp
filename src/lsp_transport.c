@@ -4,9 +4,22 @@
 #include <string.h>
 #include <stdarg.h>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 void lsp_transport_init(LspTransport *t, FILE *in, FILE *out, const char *log_path) {
     t->in = in ? in : stdin;
     t->out = out ? out : stdout;
+#ifdef _WIN32
+    /*
+     * LSP framing requires exact CRLF bytes. Prevent the Windows text
+     * runtime from translating '\n' and generating malformed headers.
+     */
+    _setmode(_fileno(t->in), _O_BINARY);
+    _setmode(_fileno(t->out), _O_BINARY);
+#endif
     t->log_file = NULL;
     if (log_path && log_path[0]) {
         t->log_file = fopen(log_path, "a");
