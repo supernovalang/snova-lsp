@@ -61,92 +61,10 @@ static void diag_list_add(CapturedDiagList *dl, int code, SnDiagLevel level, SnS
     cd->file_path = strdup(file_path ? file_path : "");
 }
 
-static void parse_diagnostics_from_buffer(CapturedDiagList *dl, const char *buf, size_t len) {
-    if (!buf || len == 0) return;
-    const char *p = buf;
-    const char *end = buf + len;
-
-    while (p < end) {
-        // Find line start
-        while (p < end && (*p == '\r' || *p == '\n')) p++;
-        if (p >= end) break;
-
-        // Check for "error[SNOVA" or "warning[SNOVA"
-        SnDiagLevel level = SN_DIAG_ERROR;
-        int code = 0;
-        if (strncmp(p, "error[SNOVA", 11) == 0) {
-            level = SN_DIAG_ERROR;
-            p += 11;
-            code = (int)strtoul(p, (char **)&p, 10);
-        } else if (strncmp(p, "warning[SNOVA", 13) == 0) {
-            level = SN_DIAG_WARNING;
-            p += 13;
-            code = (int)strtoul(p, (char **)&p, 10);
-        } else {
-            // Advance to next line
-            while (p < end && *p != '\n') p++;
-            continue;
-        }
-
-        // Skip to "]: "
-        while (p < end && *p != ']' && *p != '\n') p++;
-        if (p < end && *p == ']') p++;
-        if (p < end && *p == ':') p++;
-        while (p < end && *p == ' ') p++;
-
-        // Read message up to newline
-        const char *msg_start = p;
-        while (p < end && *p != '\r' && *p != '\n') p++;
-        size_t msg_len = (size_t)(p - msg_start);
-        char msg_buf[1024];
-        if (msg_len >= sizeof(msg_buf)) msg_len = sizeof(msg_buf) - 1;
-        memcpy(msg_buf, msg_start, msg_len);
-        msg_buf[msg_len] = '\0';
-
-        // Read location line: " --> path:line:col"
-        while (p < end && (*p == '\r' || *p == '\n')) p++;
-        while (p < end && (*p == ' ' || *p == '\t')) p++;
-
-        char path_buf[1024] = {0};
-        uint32_t line = 1, col = 1;
-        if (p + 3 <= end && strncmp(p, "-->", 3) == 0) {
-            p += 3;
-            while (p < end && *p == ' ') p++;
-            const char *loc_start = p;
-            while (p < end && *p != '\r' && *p != '\n') p++;
-            const char *loc_end = p;
-
-            // Parse path:line:col from back
-            const char *c2 = loc_end - 1;
-            while (c2 > loc_start && isdigit((unsigned char)*c2)) c2--;
-            if (c2 > loc_start && *c2 == ':') {
-                col = (uint32_t)strtoul(c2 + 1, NULL, 10);
-                const char *c1 = c2 - 1;
-                while (c1 > loc_start && isdigit((unsigned char)*c1)) c1--;
-                if (c1 > loc_start && *c1 == ':') {
-                    line = (uint32_t)strtoul(c1 + 1, NULL, 10);
-                    size_t plen = (size_t)(c1 - loc_start);
-                    if (plen >= sizeof(path_buf)) plen = sizeof(path_buf) - 1;
-                    memcpy(path_buf, loc_start, plen);
-                    path_buf[plen] = '\0';
-                }
-            }
-        }
-
-        SnSpan span = {
-            .offset = 0,
-            .len = 1,
-            .line = line,
-            .col = col
-        };
-
-        diag_list_add(dl, code, level, span, msg_buf, path_buf);
-
-        // Advance past rest of diagnostic snippet
-        while (p < end && !(p[0] == '\n' && (strncmp(p + 1, "error[SNOVA", 11) == 0 || strncmp(p + 1, "warning[SNOVA", 13) == 0))) {
-            p++;
-        }
-    }
+static void capture_diagnostic(void *ctx, SnDiagLevel level, int code,
+                               SnSpan span, const char *message,
+                               const char *file_path) {
+    diag_list_add((CapturedDiagList *)ctx, code, level, span, message, file_path);
 }
 
 static void free_analysis(LspDocAnalysis *a) {
@@ -280,13 +198,9 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
     sn_intern_init(&a->intern, &a->arena);
     diag_list_init(&a->diags);
 
-    // Use a temporary stream so the LSP remains portable to C runtimes that
-    // do not provide the GNU-only open_memstream extension.
-    char *diag_buf = NULL;
-    size_t diag_size = 0;
-    FILE *diag_mem = tmpfile();
-
     sn_diag_init(&a->diag, a->path ? a->path : "", doc->text, doc->text_len);
+    sn_diag_set_callback(&a->diag, capture_diagnostic, &a->diags);
+    FILE *diag_mem = tmpfile();
     a->diag.out = diag_mem;
     a->diag.use_color = 0;
 
@@ -353,27 +267,9 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
     SnBodyCheckScope scope = { .own_prefix = a->path };
     check_all_bodies(&a->checker, &a->resolver, &a->graph, &a->arena, &scope);
 
-    // Close and flush diagnostics
-    if (diag_mem) {
-        long end = ftell(diag_mem);
-        if (end > 0) {
-            diag_size = (size_t)end;
-            diag_buf = (char *)malloc(diag_size + 1);
-            if (diag_buf) {
-                rewind(diag_mem);
-                diag_size = fread(diag_buf, 1, diag_size, diag_mem);
-                diag_buf[diag_size] = '\0';
-            } else {
-                diag_size = 0;
-            }
-        }
-        fclose(diag_mem);
-    }
-    a->diag.out = NULL;
     a->diag.quiet = 1;
-    if (diag_buf && diag_size > 0) {
-        parse_diagnostics_from_buffer(&a->diags, diag_buf, diag_size);
-        free(diag_buf);
+    if (diag_mem) {
+        fclose(diag_mem);
     }
 
     // Insert into analyses chain

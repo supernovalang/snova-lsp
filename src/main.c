@@ -43,6 +43,10 @@ static void publish_diagnostics(LspTransport *t, const LspDocument *doc, const L
 
     for (size_t i = 0; i < a->diags.len; i++) {
         const CapturedDiag *cd = &a->diags.items[i];
+        if (cd->file_path && cd->file_path[0] &&
+            doc->path && strcmp(cd->file_path, doc->path) != 0) {
+            continue;
+        }
         
         LspRange r = lsp_span_to_range(doc, cd->span.offset, cd->span.len, cd->span.line, cd->span.col);
 

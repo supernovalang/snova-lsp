@@ -3,6 +3,10 @@ module github.com/supernovalang/snova-lsp https://github.com/supernovalang/snova
 snova "1.0.0"
 
 dependencies(
+    paths = [
+        "src",
+        ".snovalang/deps"
+    ],
     direct = [
     ],
     indirect = [

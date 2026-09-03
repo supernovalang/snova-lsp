@@ -374,7 +374,9 @@ char *lsp_code_action_query(LspAnalysisEngine *engine, LspDocStore *store, const
             extract_token_text_at_range(doc, diag_range, tok_text, sizeof(tok_text));
 
             // A. Type not imported / Undeclared name (SNOVA0121 / SNOVA0023)
-            if (strstr(code_str, "0121") || strstr(code_str, "0023") || strstr(msg, "not imported") || strstr(msg, "undeclared")) {
+            if (strstr(code_str, "0121") || strstr(code_str, "0023") ||
+                strstr(code_str, "0027") || strstr(msg, "not imported") ||
+                strstr(msg, "undeclared") || strstr(msg, "Unknown type")) {
                 if (tok_text[0]) {
                     add_auto_import_actions(&list, a, doc, tok_text);
                 }
