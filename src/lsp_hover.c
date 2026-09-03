@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 static const char *get_keyword_doc(SnTokKind kind) {
     switch (kind) {
@@ -20,7 +21,7 @@ static const char *get_keyword_doc(SnTokKind kind) {
         case SN_TOK_IF: return "```snova\nif <cond> { ... } else { ... }\n```\nConditional execution or ternary expression.";
         case SN_TOK_WHILE: return "```snova\nwhile <cond> { ... }\n```\nRepeats a block of statements while the condition is true.";
         case SN_TOK_FOR: return "```snova\nfor (let item in collection) { ... }\n```\nIterates over elements in an iterable or stream.";
-        case SN_TOK_MATCH: return "```snova\nmatch <expr> { pattern => ... }\n```\nPattern matching on values, enums, and structures.";
+        case SN_TOK_MATCH: return "```snova\nmatch <expr> { pattern -> ... }\n```\nPattern matching on values, enums, and structures.";
         case SN_TOK_RETURN: return "```snova\nreturn [<expr>]\n```\nReturns a value from a function or method.";
         case SN_TOK_ASYNC: return "```snova\nasync func / async method\n```\nDeclares an asynchronous function returning a Task.";
         case SN_TOK_AWAIT: return "```snova\nawait <future-expr>\n```\nSuspends execution until a Task is completed.";
@@ -113,6 +114,100 @@ static void format_decl_signature(const SnDecl *d, char *out, size_t out_sz) {
     }
 }
 
+/* Parses doc comment format:
+ * /* -- Doc:{Name}
+ *  * -- Description: ...
+ *  * -- Param{name}: ...
+ *  * -- Returns: ...
+ *  *\/
+ */
+static void extract_doc_comment(const char *src, size_t src_len, uint32_t decl_offset, char *out, size_t out_sz) {
+    if (!src || decl_offset == 0 || decl_offset > src_len) return;
+
+    // Scan backwards from decl_offset to find comment
+    size_t p = decl_offset;
+    while (p > 0 && (src[p - 1] == ' ' || src[p - 1] == '\t' || src[p - 1] == '\n' || src[p - 1] == '\r')) {
+        p--;
+    }
+
+    if (p < 2 || src[p - 2] != '*' || src[p - 1] != '/') {
+        return;
+    }
+
+    size_t comment_end = p;
+    size_t comment_start = comment_end - 2;
+    while (comment_start > 0 && !(src[comment_start] == '/' && src[comment_start + 1] == '*')) {
+        comment_start--;
+    }
+
+    if (src[comment_start] != '/' || src[comment_start + 1] != '*') {
+        return;
+    }
+
+    // Parse comment lines
+    const char *c = src + comment_start;
+    size_t clen = comment_end - comment_start;
+    
+    char desc[1024] = {0};
+    char params[1024] = {0};
+    char returns[256] = {0};
+
+    char line[512];
+    size_t i = 0;
+    while (i < clen) {
+        size_t lstart = i;
+        while (i < clen && c[i] != '\n') i++;
+        size_t llen = i - lstart;
+        if (i < clen && c[i] == '\n') i++;
+
+        if (llen >= sizeof(line)) llen = sizeof(line) - 1;
+        memcpy(line, c + lstart, llen);
+        line[llen] = '\0';
+
+        // Strip leading whitespace and '*'
+        char *lp = line;
+        while (*lp == ' ' || *lp == '\t' || *lp == '/' || *lp == '*') lp++;
+
+        if (strncmp(lp, "-- Description:", 15) == 0) {
+            lp += 15;
+            while (*lp == ' ') lp++;
+            snprintf(desc + strlen(desc), sizeof(desc) - strlen(desc), "%s ", lp);
+        } else if (strncmp(lp, "-- Param{", 9) == 0) {
+            char *pname = lp + 9;
+            char *pend = strchr(pname, '}');
+            if (pend) {
+                *pend = '\0';
+                char *pval = pend + 1;
+                if (*pval == ':') pval++;
+                while (*pval == ' ') pval++;
+                snprintf(params + strlen(params), sizeof(params) - strlen(params), "\n- `%s`: %s", pname, pval);
+            }
+        } else if (strncmp(lp, "-- Returns:", 11) == 0) {
+            lp += 11;
+            while (*lp == ' ') lp++;
+            snprintf(returns, sizeof(returns), "%s", lp);
+        } else if (strncmp(lp, "-- ", 3) == 0 && desc[0] != '\0' && params[0] == '\0' && returns[0] == '\0') {
+            lp += 3;
+            snprintf(desc + strlen(desc), sizeof(desc) - strlen(desc), "%s ", lp);
+        }
+    }
+
+    if (desc[0] != '\0' || params[0] != '\0' || returns[0] != '\0') {
+        size_t cur = strlen(out);
+        if (desc[0] != '\0') {
+            snprintf(out + cur, out_sz - cur, "\n\n%s", desc);
+            cur = strlen(out);
+        }
+        if (params[0] != '\0') {
+            snprintf(out + cur, out_sz - cur, "\n\n**Parameters:**%s", params);
+            cur = strlen(out);
+        }
+        if (returns[0] != '\0') {
+            snprintf(out + cur, out_sz - cur, "\n\n**Returns:** %s", returns);
+        }
+    }
+}
+
 char *lsp_hover_query(LspAnalysisEngine *engine, const LspDocument *doc, LspPosition pos) {
     if (!doc) return NULL;
     LspDocAnalysis *a = lsp_engine_get_analysis(engine, doc->uri);
@@ -125,7 +220,7 @@ char *lsp_hover_query(LspAnalysisEngine *engine, const LspDocument *doc, LspPosi
     const SnToken *tok = lsp_find_token_at(a, offset);
     if (!tok) return NULL;
 
-    char hover_text[2048] = {0};
+    char hover_text[4096] = {0};
 
     // 1. Keyword doc
     if (sn_tok_is_keyword(tok->kind)) {
@@ -158,12 +253,15 @@ char *lsp_hover_query(LspAnalysisEngine *engine, const LspDocument *doc, LspPosi
         }
     }
 
-    // 3. Symbol lookup
+    // 3. Symbol lookup with doc comment extraction
     if (hover_text[0] == '\0') {
         const char *name = NULL;
         const SnSymbol *sym = lsp_find_symbol_at(a, doc, offset, &name);
         if (sym && sym->decl) {
             format_decl_signature(sym->decl, hover_text, sizeof(hover_text));
+            const char *src = sym->origin ? sym->origin->src : doc->text;
+            size_t src_len = sym->origin ? sym->origin->src_len : doc->text_len;
+            extract_doc_comment(src, src_len, sym->decl->span.offset, hover_text, sizeof(hover_text));
         } else if (sym) {
             const char *kind_str = (sym->kind == SN_SYM_PARAM) ? "parameter" : "variable";
             snprintf(hover_text, sizeof(hover_text), "```snova\n(%s) %s\n```", kind_str, sym->name ? sym->name : "");
@@ -175,6 +273,7 @@ char *lsp_hover_query(LspAnalysisEngine *engine, const LspDocument *doc, LspPosi
         const SnDecl *decl = lsp_find_decl_at(a, offset);
         if (decl) {
             format_decl_signature(decl, hover_text, sizeof(hover_text));
+            extract_doc_comment(doc->text, doc->text_len, decl->span.offset, hover_text, sizeof(hover_text));
         }
     }
 
