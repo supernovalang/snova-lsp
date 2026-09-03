@@ -671,3 +671,154 @@ const SnSymbol *lsp_find_symbol_at(const LspDocAnalysis *a, const LspDocument *d
 
     return NULL;
 }
+
+/* -----------------------------------------------------------------------
+ * Snova Manifest Analysis  (mod.sno / snova.mod)
+ * Parses the manifest text and produces LSP diagnostics for:
+ *   - missing/malformed "module" declaration
+ *   - missing/malformed "snova" version declaration
+ *   - malformed "dependencies(...)" block
+ * ----------------------------------------------------------------------- */
+
+/* Returns a heap-allocated LspDocAnalysis with diagnostics only.
+   The analysis is inserted into the engine cache under the document URI. */
+LspDocAnalysis *lsp_engine_analyze_manifest(LspAnalysisEngine *engine, const LspDocument *doc) {
+    if (!engine || !doc || !doc->text) return NULL;
+
+    /* Remove any previously cached analysis for this URI */
+    lsp_engine_remove_analysis(engine, doc->uri);
+
+    LspDocAnalysis *a = (LspDocAnalysis *)malloc(sizeof(LspDocAnalysis));
+    if (!a) return NULL;
+    memset(a, 0, sizeof(LspDocAnalysis));
+    a->uri     = strdup(doc->uri);
+    a->path    = strdup(doc->path ? doc->path : "");
+    a->version = doc->version;
+    sn_arena_init(&a->arena, 64 * 1024);
+    diag_list_init(&a->diags);
+
+    const char *src   = doc->text;
+    size_t      src_len = doc->text_len;
+    const char *end   = src + src_len;
+
+    /* ── helpers ────────────────────────────────────────────────────── */
+#define MANIFEST_ERR(LINE, COL, MSG) \
+    do { \
+        SnSpan _sp = { .offset = 0, .len = 1, .line = (LINE), .col = (COL) }; \
+        diag_list_add(&a->diags, 0, SN_DIAG_ERROR, _sp, (MSG), a->path); \
+    } while (0)
+
+#define MANIFEST_WARN(LINE, COL, MSG) \
+    do { \
+        SnSpan _sp = { .offset = 0, .len = 1, .line = (LINE), .col = (COL) }; \
+        diag_list_add(&a->diags, 0, SN_DIAG_WARNING, _sp, (MSG), a->path); \
+    } while (0)
+
+    bool found_module      = false;
+    bool found_snova_ver   = false;
+    bool found_deps        = false;
+    bool deps_paren_open   = false;
+    bool deps_paren_close  = false;
+
+    /* ── line-by-line scan ──────────────────────────────────────────── */
+    const char *p    = src;
+    uint32_t    lnum = 1;
+
+    while (p < end) {
+        /* skip leading whitespace (but not newlines) */
+        const char *line_start = p;
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+
+        /* detect comment: # or // */
+        if (p < end && (*p == '#' || (p + 1 < end && p[0] == '/' && p[1] == '/'))) {
+            /* skip until end of line */
+            while (p < end && *p != '\n') p++;
+            if (p < end && *p == '\n') p++;
+            lnum++;
+            continue;
+        }
+
+        /* find end of line */
+        const char *line_end = p;
+        while (line_end < end && *line_end != '\n') line_end++;
+
+        size_t line_len = (size_t)(line_end - line_start);
+        char line_buf[512];
+        if (line_len >= sizeof(line_buf)) line_len = sizeof(line_buf) - 1;
+        memcpy(line_buf, line_start, line_len);
+        line_buf[line_len] = '\0';
+
+        /* ── "module <name> [<url>]" ─────────────────────────────── */
+        if (strncmp(p, "module", 6) == 0 && (p + 6 >= end || p[6] == ' ' || p[6] == '\t' || p[6] == '\n' || p[6] == '\r')) {
+            found_module = true;
+            const char *after = p + 6;
+            while (after < line_end && (*after == ' ' || *after == '\t')) after++;
+            if (after >= line_end || *after == '\r' || *after == '\n') {
+                MANIFEST_ERR(lnum, 1, "manifest: 'module' declaration is missing a module path");
+            }
+        }
+        /* ── "snova \"<semver>\"" ─────────────────────────────────── */
+        else if (strncmp(p, "snova", 5) == 0 && (p + 5 >= end || p[5] == ' ' || p[5] == '\t' || p[5] == '"')) {
+            /* distinguish from "snova-lsp" or other identifiers */
+            if (p + 5 < line_end && (p[5] == ' ' || p[5] == '\t' || p[5] == '"')) {
+                found_snova_ver = true;
+                const char *after = p + 5;
+                while (after < line_end && (*after == ' ' || *after == '\t')) after++;
+                if (after >= line_end || *after != '"') {
+                    MANIFEST_ERR(lnum, (uint32_t)(after - line_start) + 1,
+                                 "manifest: 'snova' version must be a quoted semantic version, e.g. snova \"1.0.0\"");
+                }
+            }
+        }
+        /* ── "dependencies(...)" block ───────────────────────────── */
+        else if (strncmp(p, "dependencies", 12) == 0) {
+            found_deps = true;
+            /* Scan for opening parenthesis on this or following lines */
+            const char *q = p + 12;
+            while (q < line_end && (*q == ' ' || *q == '\t')) q++;
+            if (q < line_end && *q == '(') {
+                deps_paren_open = true;
+            } else if (q >= line_end) {
+                /* opening paren may be on the next line — tolerate */
+                deps_paren_open = true;
+            } else {
+                MANIFEST_ERR(lnum, (uint32_t)(q - line_start) + 1,
+                             "manifest: expected '(' after 'dependencies'");
+            }
+        }
+        /* ── closing ')' for dependencies block ─────────────────── */
+        else if (deps_paren_open && !deps_paren_close && p < line_end && *p == ')') {
+            deps_paren_close = true;
+        }
+
+        /* advance to next line */
+        p = line_end;
+        if (p < end && *p == '\n') p++;
+        lnum++;
+    }
+
+    /* ── post-scan validations ───────────────────────────────────── */
+    if (!found_module) {
+        MANIFEST_ERR(1, 1, "manifest: missing 'module' declaration (e.g. module github.com/org/repo)");
+    }
+    if (!found_snova_ver) {
+        MANIFEST_WARN(1, 1, "manifest: missing 'snova' version declaration (e.g. snova \"1.0.0\")");
+    }
+    if (found_deps && deps_paren_open && !deps_paren_close) {
+        MANIFEST_ERR(lnum > 1 ? lnum - 1 : 1, 1,
+                     "manifest: 'dependencies(...)' block is missing closing ')'");
+    }
+
+#undef MANIFEST_ERR
+#undef MANIFEST_WARN
+
+    /* mark as manifest — no AST available */
+    a->has_ast      = false;
+    a->has_resolved = false;
+
+    /* insert into engine cache */
+    a->next          = engine->analyses;
+    engine->analyses = a;
+    return a;
+}
+

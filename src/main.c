@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <inttypes.h>
 
 static void publish_diagnostics(LspTransport *t, const LspDocument *doc, const LspDocAnalysis *a) {
     if (!t || !doc || !a) return;
@@ -75,6 +76,8 @@ static void publish_diagnostics(LspTransport *t, const LspDocument *doc, const L
 
     char *json_str = jb_take(&jb);
     if (json_str) {
+        lsp_log(t, "[LSP OUT] textDocument/publishDiagnostics uri=%s version=%d diag_count=%zu",
+                doc->uri, doc->version, a->diags.len);
         lsp_transport_write_message(t, json_str, strlen(json_str));
         free(json_str);
     }
@@ -107,6 +110,16 @@ static void send_response(LspTransport *t, const JsonVal *id, const char *result
     jb_end_obj(&jb);
     char *msg = jb_take(&jb);
     if (msg) {
+        // Log the id being responded to and a preview of the result payload
+        if (id && id->kind == JSON_NUMBER) {
+            lsp_log(t, "[LSP OUT] response id=%" PRId64 " result=%.200s",
+                    (int64_t)id->num_val, msg);
+        } else if (id && id->kind == JSON_STRING) {
+            lsp_log(t, "[LSP OUT] response id=\"%s\" result=%.200s",
+                    id->str_val, msg);
+        } else {
+            lsp_log(t, "[LSP OUT] response id=null result=%.200s", msg);
+        }
         lsp_transport_write_message(t, msg, strlen(msg));
         free(msg);
     }
@@ -152,6 +165,15 @@ int main(int argc, char **argv) {
         const char *method = json_get_str(req, "method", "");
         const JsonVal *id = json_get(req, "id");
         const JsonVal *params = json_get_obj(req, "params");
+
+        // Log every incoming request / notification
+        if (id && id->kind == JSON_NUMBER) {
+            lsp_log(&transport, "[LSP IN ] method=%s id=%" PRId64, method, (int64_t)id->num_val);
+        } else if (id && id->kind == JSON_STRING) {
+            lsp_log(&transport, "[LSP IN ] method=%s id=\"%s\"", method, id->str_val);
+        } else {
+            lsp_log(&transport, "[LSP IN ] method=%s (notification)", method);
+        }
 
         if (strcmp(method, "initialize") == 0) {
             const char *root_uri = json_get_str(params, "rootUri", NULL);
@@ -206,12 +228,28 @@ int main(int argc, char **argv) {
         } else if (strcmp(method, "textDocument/didOpen") == 0) {
             const JsonVal *td = json_get_obj(params, "textDocument");
             if (td) {
-                const char *uri = json_get_str(td, "uri", "");
-                int version = (int)json_get_int(td, "version", 0);
-                const char *text = json_get_str(td, "text", "");
+                const char *uri      = json_get_str(td, "uri", "");
+                const char *lang_id  = json_get_str(td, "languageId", "");
+                int version          = (int)json_get_int(td, "version", 0);
+                const char *text     = json_get_str(td, "text", "");
                 LspDocument *doc = lsp_docstore_open(&doc_store, uri, version, text, strlen(text));
                 if (doc) {
-                    LspDocAnalysis *a = lsp_engine_analyze_document(&engine, &doc_store, doc);
+                    /* Route manifest files (mod.sno / snova-manifest language) to
+                       the dedicated manifest analyser; all other .sno files go through
+                       the full compiler pipeline. */
+                    bool is_manifest = (strcmp(lang_id, "snova-manifest") == 0);
+                    if (!is_manifest && doc->path) {
+                        /* Also detect by file name in case the editor doesn't set languageId */
+                        const char *base = strrchr(doc->path, '/');
+                        if (!base) base = strrchr(doc->path, '\\');
+                        base = base ? base + 1 : doc->path;
+                        is_manifest = (strcmp(base, "mod.sno") == 0 ||
+                                       strcmp(base, "snova.mod") == 0 ||
+                                       strcmp(base, "snova.sno") == 0);
+                    }
+                    LspDocAnalysis *a = is_manifest
+                        ? lsp_engine_analyze_manifest(&engine, doc)
+                        : lsp_engine_analyze_document(&engine, &doc_store, doc);
                     if (a) {
                         publish_diagnostics(&transport, doc, a);
                     }
@@ -227,7 +265,18 @@ int main(int argc, char **argv) {
                 const char *text = json_get_str(last_change, "text", "");
                 LspDocument *doc = lsp_docstore_update(&doc_store, uri, version, text, strlen(text));
                 if (doc) {
-                    LspDocAnalysis *a = lsp_engine_analyze_document(&engine, &doc_store, doc);
+                    bool is_manifest = false;
+                    if (doc->path) {
+                        const char *base = strrchr(doc->path, '/');
+                        if (!base) base = strrchr(doc->path, '\\');
+                        base = base ? base + 1 : doc->path;
+                        is_manifest = (strcmp(base, "mod.sno") == 0 ||
+                                       strcmp(base, "snova.mod") == 0 ||
+                                       strcmp(base, "snova.sno") == 0);
+                    }
+                    LspDocAnalysis *a = is_manifest
+                        ? lsp_engine_analyze_manifest(&engine, doc)
+                        : lsp_engine_analyze_document(&engine, &doc_store, doc);
                     if (a) {
                         publish_diagnostics(&transport, doc, a);
                     }
