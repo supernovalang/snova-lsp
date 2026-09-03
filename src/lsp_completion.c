@@ -802,6 +802,87 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
             collect_scope_symbols(&list, a->resolver.prelude_scope, ctx, 70, has_following_paren);
         }
 
+        // Symbols from all dependency / workspace packages (e.g. .snovalang/deps/**/*.snova)
+        for (SnPackageScopeEntry *pe = a->resolver.packages; pe; pe = pe->next) {
+            if (!pe->package_name || !pe->scope) continue;
+            if (pkg_name && strcmp(pe->package_name, pkg_name) == 0) continue;
+
+            bool in_imports = false;
+            for (size_t i = 0; i < a->unit.imports.len; i++) {
+                const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
+                if (imp && strcmp(imp, pe->package_name) == 0) {
+                    in_imports = true;
+                    break;
+                }
+            }
+            if (in_imports) continue;
+
+            for (size_t b = 0; b < pe->scope->nbuckets; b++) {
+                for (SnSymbol *sym = pe->scope->buckets[b]; sym; sym = sym->next) {
+                    if (!sym->name || !sym->name[0]) continue;
+                    if (sym->decl && sym->decl->vis != SN_VIS_PUBLIC && sym->decl->vis != SN_VIS_DEFAULT) continue;
+
+                    LspCompletionKind kind = LSP_COMPLETION_VARIABLE;
+                    const char *kind_str = "symbol";
+                    int type_bonus = 0;
+
+                    switch (sym->kind) {
+                        case SN_SYM_TYPE:
+                            kind = LSP_COMPLETION_CLASS;
+                            kind_str = "type";
+                            type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
+                            break;
+                        case SN_SYM_FUNC:
+                            kind = LSP_COMPLETION_FUNCTION;
+                            kind_str = "func";
+                            break;
+                        case SN_SYM_METHOD:
+                            kind = LSP_COMPLETION_METHOD;
+                            kind_str = "method";
+                            break;
+                        case SN_SYM_CONST:
+                            kind = LSP_COMPLETION_CONSTANT;
+                            kind_str = "const";
+                            break;
+                        case SN_SYM_VARIANT:
+                            kind = LSP_COMPLETION_ENUM_MEMBER;
+                            kind_str = "variant";
+                            break;
+                        default:
+                            continue;
+                    }
+
+                    if (ctx == CTX_TYPE_POS && sym->kind != SN_SYM_TYPE) {
+                        continue;
+                    }
+
+                    char detail[512];
+                    snprintf(detail, sizeof(detail), "%s %s (from %s)", kind_str, sym->name, pe->package_name);
+
+                    char insert_text[256];
+                    int insert_fmt = 1;
+                    if ((sym->kind == SN_SYM_FUNC || sym->kind == SN_SYM_METHOD) && !has_following_paren) {
+                        snprintf(insert_text, sizeof(insert_text), "%s($1)", sym->name);
+                        insert_fmt = 2;
+                    } else {
+                        snprintf(insert_text, sizeof(insert_text), "%s", sym->name);
+                    }
+
+                    complist_add(&list, sym->name, kind, detail, pe->package_name, insert_text, insert_fmt, pe->package_name, 70, type_bonus);
+                }
+            }
+        }
+
+        // Package modules recommendations (especially in import lines)
+        for (SnPackageNode *pn = a->graph.nodes; pn; pn = pn->next) {
+            if (pn->name && pn->name[0]) {
+                char detail[256];
+                snprintf(detail, sizeof(detail), "package %s", pn->name);
+                int base_pkg_score = (ctx == CTX_IMPORT_LINE) ? 90 : 60;
+                complist_add(&list, pn->name, LSP_COMPLETION_MODULE, detail, "Snovalang package dependency", pn->name, 1, NULL, base_pkg_score, 0);
+            }
+        }
+
         // Type member scopes (when in member access)
         if (ctx == CTX_MEMBER && receiver_buf[0]) {
             for (SnTypeScopeEntry *te = a->resolver.type_scopes; te; te = te->next) {

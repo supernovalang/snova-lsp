@@ -1,0 +1,10 @@
+module github.com/supernovalang/snova-lsp https://github.com/supernovalang/snova-lsp
+
+snova "1.0.0"
+
+dependencies(
+    direct = [
+    ],
+    indirect = [
+    ]
+)

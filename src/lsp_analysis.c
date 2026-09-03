@@ -230,22 +230,51 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
     sn_types_init(&a->types, &a->arena);
     sn_resolver_init(&a->resolver, &a->arena, &a->intern, &diag, &a->graph, &a->types);
 
-    // Scan project roots / builtins
+    // Scan project roots, .snovalang/deps, and builtins
+    SnProject proj;
+    memset(&proj, 0, sizeof(proj));
+    const char *scan_start = (a->path && a->path[0]) ? a->path : engine->workspace_root;
+    if (scan_start && scan_start[0]) {
+        project_discover(scan_start, &proj);
+    }
+
+    if (proj.has_manifest) {
+        if (proj.source_root[0]) {
+            sn_pkggraph_scan_root(&a->graph, proj.source_root);
+        }
+        if (proj.deps_root[0]) {
+            sn_pkggraph_scan_root(&a->graph, proj.deps_root);
+        }
+    } else if (engine->workspace_root[0]) {
+        char ws_deps[SNOVAC_PATH_MAX + 32];
+        snprintf(ws_deps, sizeof(ws_deps), "%s/.snovalang/deps", engine->workspace_root);
+        if (path_is_dir(ws_deps)) {
+            sn_pkggraph_scan_root(&a->graph, ws_deps);
+        }
+        char ws_src[SNOVAC_PATH_MAX + 16];
+        snprintf(ws_src, sizeof(ws_src), "%s/src", engine->workspace_root);
+        if (path_is_dir(ws_src)) {
+            sn_pkggraph_scan_root(&a->graph, ws_src);
+        }
+    }
+
+    if (a->path && a->path[0]) {
+        sn_pkggraph_scan_single_file(&a->graph, a->path);
+    }
+
+    const char *source_for_std = proj.source_root[0] ? proj.source_root : ((a->path && a->path[0]) ? a->path : engine->workspace_root);
+    char std_dir[SNOVAC_PATH_MAX];
+    if (find_std_root_for_project(source_for_std, std_dir, sizeof(std_dir))) {
+        sn_pkggraph_scan_root_fallback(&a->graph, std_dir);
+    }
+
+    char builtin_find[SNOVAC_PATH_MAX];
     if (engine->builtin_dir[0]) {
         sn_pkggraph_scan_root(&a->graph, engine->builtin_dir);
         sn_pkggraph_load_native_manifest(&a->graph, engine->builtin_dir);
-    }
-
-    if (a->path[0]) {
-        char dir[SNOVAC_PATH_MAX];
-        dirname_into(a->path, dir, sizeof(dir));
-        sn_pkggraph_scan_single_file(&a->graph, a->path);
-        
-        char builtin_find[SNOVAC_PATH_MAX];
-        if (find_builtin_root_for_project(dir, builtin_find, sizeof(builtin_find))) {
-            sn_pkggraph_scan_root(&a->graph, builtin_find);
-            sn_pkggraph_load_native_manifest(&a->graph, builtin_find);
-        }
+    } else if (find_builtin_root_for_project(source_for_std, builtin_find, sizeof(builtin_find))) {
+        sn_pkggraph_scan_root(&a->graph, builtin_find);
+        sn_pkggraph_load_native_manifest(&a->graph, builtin_find);
     }
 
     sn_pkggraph_link(&a->graph);

@@ -212,12 +212,126 @@ static void test_decorator_ranking(void) {
     printf("✓ test_decorator_ranking passed\n");
 }
 
+static void test_deps_recommendation(void) {
+    // 1. Setup temporary workspace with .snovalang/deps/**/*.snova
+    system("rm -rf /tmp/snova_lsp_deps_test");
+    system("mkdir -p /tmp/snova_lsp_deps_test/.snovalang/deps/snova-remote/src");
+    system("mkdir -p /tmp/snova_lsp_deps_test/src");
+
+    FILE *f_manifest = fopen("/tmp/snova_lsp_deps_test/mod.sno", "w");
+    if (f_manifest) {
+        fprintf(f_manifest, "module app\n\nsnova \"1.0.0\"\n");
+        fclose(f_manifest);
+    }
+
+    FILE *f_dep = fopen("/tmp/snova_lsp_deps_test/.snovalang/deps/snova-remote/src/Remote.snova", "w");
+    if (f_dep) {
+        fprintf(f_dep,
+            "package Snova.Remote\n\n"
+            "public class RemoteClient {\n"
+            "    public var endpoint: string\n"
+            "}\n\n"
+            "public func fetchRemoteData(): string {\n"
+            "    return \"payload\"\n"
+            "}\n");
+        fclose(f_dep);
+    }
+
+    LspDocStore store;
+    lsp_docstore_init(&store);
+
+    LspAnalysisEngine engine;
+    lsp_engine_init(&engine, "/tmp/snova_lsp_deps_test");
+
+    const char *code =
+        "package main\n"
+        "\n"
+        "func app(): unit {\n"
+        "    fetchRemote\n"
+        "}\n";
+
+    LspDocument *doc = lsp_docstore_open(&store, "file:///tmp/snova_lsp_deps_test/src/App.snova", 1, code, strlen(code));
+    assert(doc != NULL);
+
+    // Query completion after typing "fetchRemote"
+    LspPosition pos = { .line = 3, .character = 15 };
+    char *json_res = lsp_completion_query(&engine, &store, doc, pos);
+    assert(json_res != NULL);
+
+    JsonPool *pool = json_pool_create(strlen(json_res) + 1024);
+    const char *err = NULL;
+    JsonVal *root = json_parse(pool, json_res, strlen(json_res), &err);
+    assert(root != NULL);
+
+    const JsonVal *items = json_get_arr(root, "items");
+    assert(items != NULL);
+    size_t count = json_arr_len(items);
+    assert(count > 0);
+
+    bool found_remote_func = false;
+    for (size_t i = 0; i < count; i++) {
+        const JsonVal *item = json_arr_at(items, i);
+        const char *label = json_get_str(item, "label", "");
+        if (strcmp(label, "fetchRemoteData") == 0) {
+            found_remote_func = true;
+            const char *detail = json_get_str(item, "detail", "");
+            assert(strstr(detail, "Snova.Remote") != NULL);
+            break;
+        }
+    }
+    assert(found_remote_func);
+
+    json_pool_destroy(pool);
+    free(json_res);
+
+    // Also test type recommendation: "Remote" -> RemoteClient
+    const char *code2 =
+        "package main\n"
+        "\n"
+        "func app(): unit {\n"
+        "    let c: Remote\n"
+        "}\n";
+    doc = lsp_docstore_open(&store, "file:///tmp/snova_lsp_deps_test/src/App.snova", 2, code2, strlen(code2));
+    assert(doc != NULL);
+
+    LspPosition pos2 = { .line = 3, .character = 17 };
+    char *json_res2 = lsp_completion_query(&engine, &store, doc, pos2);
+    assert(json_res2 != NULL);
+
+    JsonPool *pool2 = json_pool_create(strlen(json_res2) + 1024);
+    JsonVal *root2 = json_parse(pool2, json_res2, strlen(json_res2), &err);
+    assert(root2 != NULL);
+
+    const JsonVal *items2 = json_get_arr(root2, "items");
+    assert(items2 != NULL);
+    bool found_remote_type = false;
+    for (size_t i = 0; i < json_arr_len(items2); i++) {
+        const JsonVal *item = json_arr_at(items2, i);
+        const char *label = json_get_str(item, "label", "");
+        if (strcmp(label, "RemoteClient") == 0) {
+            found_remote_type = true;
+            break;
+        }
+    }
+    assert(found_remote_type);
+
+    json_pool_destroy(pool2);
+    free(json_res2);
+
+    lsp_engine_destroy(&engine);
+    lsp_docstore_destroy(&store);
+
+    system("rm -rf /tmp/snova_lsp_deps_test");
+    printf("✓ test_deps_recommendation passed\n");
+}
+
 int main(void) {
     printf("Running LSP completion ranking unit tests...\n");
     test_general_ranking();
     test_acronym_matching();
     test_type_context_ranking();
     test_decorator_ranking();
-    printf("All completion tests passed successfully! (4/4)\n");
+    test_deps_recommendation();
+    printf("All completion tests passed successfully! (5/5)\n");
     return 0;
 }
