@@ -188,6 +188,77 @@ LspDocAnalysis *lsp_engine_get_analysis(LspAnalysisEngine *engine, const char *u
     return NULL;
 }
 
+static void register_unit_decls_in_resolver(LspDocAnalysis *a) {
+    if (!a || !a->has_ast) return;
+
+    const char *pkg_name_str = (a->unit.package && a->unit.package[0]) ? a->unit.package : "main";
+    const char *pkg_name = sn_intern_cstr(&a->intern, pkg_name_str);
+
+    SnScope *pkg_scope = sn_resolver_package_scope(&a->resolver, pkg_name);
+    if (!pkg_scope) {
+        pkg_scope = (SnScope *)sn_arena_alloc(&a->arena, sizeof(SnScope));
+        sn_scope_init(pkg_scope, &a->arena, NULL);
+        SnPackageScopeEntry *pe = (SnPackageScopeEntry *)sn_arena_alloc(&a->arena, sizeof(SnPackageScopeEntry));
+        pe->package_name = pkg_name;
+        pe->scope = pkg_scope;
+        pe->next = a->resolver.packages;
+        a->resolver.packages = pe;
+    }
+
+    for (size_t i = 0; i < a->unit.decls.len; i++) {
+        SnDecl *d = SN_LIST_AT(a->unit.decls, SnDecl, i);
+        if (!d || !d->name) continue;
+
+        const char *name = sn_intern_cstr(&a->intern, d->name);
+        SnSymbolKind sk = SN_SYM_LOCAL;
+        bool has_members = false;
+
+        if (d->kind == SN_DECL_CLASS || d->kind == SN_DECL_STRUCT ||
+            d->kind == SN_DECL_ENUM || d->kind == SN_DECL_INTERFACE) {
+            sk = SN_SYM_TYPE;
+            has_members = true;
+        } else if (d->kind == SN_DECL_FUNC) {
+            sk = SN_SYM_FUNC;
+        } else if (d->kind == SN_DECL_CONST) {
+            sk = SN_SYM_CONST;
+        }
+
+        SnSymbol *sym = sn_scope_lookup_local(pkg_scope, name);
+        if (!sym) {
+            sym = sn_scope_define(pkg_scope, name, sk, d, d->span);
+        }
+
+        if (has_members) {
+            SnScope *ms = NULL;
+            for (SnTypeScopeEntry *te = a->resolver.type_scopes; te; te = te->next) {
+                if (te->type_decl && te->type_decl->name && strcmp(te->type_decl->name, d->name) == 0) {
+                    ms = te->member_scope;
+                    break;
+                }
+            }
+            if (!ms) {
+                ms = (SnScope *)sn_arena_alloc(&a->arena, sizeof(SnScope));
+                sn_scope_init(ms, &a->arena, NULL);
+                SnTypeScopeEntry *te = (SnTypeScopeEntry *)sn_arena_alloc(&a->arena, sizeof(SnTypeScopeEntry));
+                te->type_decl = d;
+                te->member_scope = ms;
+                te->next = a->resolver.type_scopes;
+                a->resolver.type_scopes = te;
+            }
+
+            for (size_t j = 0; j < d->members.len; j++) {
+                SnDecl *m = SN_LIST_AT(d->members, SnDecl, j);
+                if (!m || !m->name) continue;
+                const char *mname = sn_intern_cstr(&a->intern, m->name);
+                SnSymbolKind msk = (m->kind == SN_DECL_METHOD) ? SN_SYM_METHOD : SN_SYM_FIELD;
+                if (!sn_scope_lookup_local(ms, mname)) {
+                    sn_scope_define(ms, mname, msk, m, m->span);
+                }
+            }
+        }
+    }
+}
+
 LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocStore *store, const LspDocument *doc) {
     (void)store;
     if (!doc) return NULL;
@@ -211,68 +282,56 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
     size_t diag_size = 0;
     FILE *diag_mem = open_memstream(&diag_buf, &diag_size);
 
-    SnDiagSink diag;
-    sn_diag_init(&diag, a->path, doc->text, doc->text_len);
-    diag.out = diag_mem;
-    diag.use_color = 0;
+    sn_diag_init(&a->diag, a->path ? a->path : "", doc->text, doc->text_len);
+    a->diag.out = diag_mem;
+    a->diag.use_color = 0;
 
     // 1. Lex
     memset(&a->tokens, 0, sizeof(a->tokens));
-    sn_lex(&a->arena, &diag, doc->text, doc->text_len, &a->tokens);
+    sn_lex(&a->arena, &a->diag, doc->text, doc->text_len, &a->tokens);
 
     // 2. Parse
     memset(&a->unit, 0, sizeof(a->unit));
-    sn_parse(&a->arena, &diag, &a->tokens, &a->unit);
+    sn_parse(&a->arena, &a->diag, &a->tokens, &a->unit);
     a->has_ast = true;
 
     // 3. Package Graph & Types & Resolution
-    sn_pkggraph_init(&a->graph, &a->arena, &a->intern, &diag);
+    sn_pkggraph_init(&a->graph, &a->arena, &a->intern, &a->diag);
     sn_types_init(&a->types, &a->arena);
-    sn_resolver_init(&a->resolver, &a->arena, &a->intern, &diag, &a->graph, &a->types);
+    sn_resolver_init(&a->resolver, &a->arena, &a->intern, &a->diag, &a->graph, &a->types);
 
     // Scan project roots, .snovalang/deps, and builtins
     SnProject proj;
     memset(&proj, 0, sizeof(proj));
-    const char *scan_start = (a->path && a->path[0]) ? a->path : engine->workspace_root;
+    const char *scan_start = (a->path && a->path[0] && strcmp(a->path, "/") != 0) ? a->path : engine->workspace_root;
     if (scan_start && scan_start[0]) {
         project_discover(scan_start, &proj);
-    }
-
-    if (proj.has_manifest) {
-        if (proj.source_root[0]) {
-            sn_pkggraph_scan_root(&a->graph, proj.source_root);
-        }
-        if (proj.deps_root[0]) {
-            sn_pkggraph_scan_root(&a->graph, proj.deps_root);
-        }
-    } else if (engine->workspace_root[0]) {
-        char ws_deps[SNOVAC_PATH_MAX + 32];
-        snprintf(ws_deps, sizeof(ws_deps), "%s/.snovalang/deps", engine->workspace_root);
-        if (path_is_dir(ws_deps)) {
-            sn_pkggraph_scan_root(&a->graph, ws_deps);
-        }
-        char ws_src[SNOVAC_PATH_MAX + 16];
-        snprintf(ws_src, sizeof(ws_src), "%s/src", engine->workspace_root);
-        if (path_is_dir(ws_src)) {
-            sn_pkggraph_scan_root(&a->graph, ws_src);
+        if (proj.has_manifest && proj.source_root[0] && strcmp(proj.source_root, "/") != 0) {
+            scan_project_roots(&a->graph, &proj);
+        } else if (engine->workspace_root[0]) {
+            char ws_deps[SNOVAC_PATH_MAX + 32];
+            snprintf(ws_deps, sizeof(ws_deps), "%s/.snovalang/deps", engine->workspace_root);
+            if (path_is_dir(ws_deps)) {
+                sn_pkggraph_scan_root(&a->graph, ws_deps);
+            }
+            char ws_src[SNOVAC_PATH_MAX + 16];
+            snprintf(ws_src, sizeof(ws_src), "%s/src", engine->workspace_root);
+            if (path_is_dir(ws_src)) {
+                sn_pkggraph_scan_root(&a->graph, ws_src);
+            }
         }
     }
 
-    if (a->path && a->path[0]) {
+    if (a->path && a->path[0] && path_is_file(a->path)) {
         sn_pkggraph_scan_single_file(&a->graph, a->path);
     }
 
-    const char *source_for_std = proj.source_root[0] ? proj.source_root : ((a->path && a->path[0]) ? a->path : engine->workspace_root);
-    char std_dir[SNOVAC_PATH_MAX];
-    if (find_std_root_for_project(source_for_std, std_dir, sizeof(std_dir))) {
-        sn_pkggraph_scan_root_fallback(&a->graph, std_dir);
-    }
-
+    const char *source_for_builtin = (proj.has_manifest && proj.source_root[0] && strcmp(proj.source_root, "/") != 0) ? proj.source_root : engine->workspace_root;
     char builtin_find[SNOVAC_PATH_MAX];
     if (engine->builtin_dir[0]) {
         sn_pkggraph_scan_root(&a->graph, engine->builtin_dir);
         sn_pkggraph_load_native_manifest(&a->graph, engine->builtin_dir);
-    } else if (find_builtin_root_for_project(source_for_std, builtin_find, sizeof(builtin_find))) {
+    } else if (source_for_builtin && source_for_builtin[0] && find_builtin_root_for_project(source_for_builtin, builtin_find, sizeof(builtin_find))) {
         sn_pkggraph_scan_root(&a->graph, builtin_find);
         sn_pkggraph_load_native_manifest(&a->graph, builtin_find);
     }
@@ -281,16 +340,19 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
 
     // 4. Resolve symbols & prelude
     sn_resolver_collect(&a->resolver);
+    register_unit_decls_in_resolver(a);
     sn_resolver_build_prelude(&a->resolver);
     a->has_resolved = true;
 
     // 5. Typecheck bodies
-    sn_checker_init(&a->checker, &a->arena, &a->intern, &diag, &a->resolver, &a->types);
+    sn_checker_init(&a->checker, &a->arena, &a->intern, &a->diag, &a->resolver, &a->types);
     SnBodyCheckScope scope = { .own_prefix = a->path };
     check_all_bodies(&a->checker, &a->resolver, &a->graph, &a->arena, &scope);
 
     // Close and flush diagnostics
     fclose(diag_mem);
+    a->diag.out = NULL;
+    a->diag.quiet = 1;
     if (diag_buf && diag_size > 0) {
         parse_diagnostics_from_buffer(&a->diags, diag_buf, diag_size);
         free(diag_buf);
@@ -318,14 +380,24 @@ static const SnDecl *find_decl_in_list(const SnList *list, uint32_t offset) {
     for (size_t i = 0; i < list->len; i++) {
         const SnDecl *d = SN_LIST_AT(*list, const SnDecl, i);
         if (!d) continue;
-        if (d->kind == SN_DECL_CLASS || d->kind == SN_DECL_STRUCT ||
-            d->kind == SN_DECL_INTERFACE || d->kind == SN_DECL_ENUM) {
-            const SnDecl *inner = find_decl_in_list(&d->members, offset);
-            if (inner) return inner;
-            const SnDecl *var_inner = find_decl_in_list(&d->variants, offset);
-            if (var_inner) return var_inner;
+
+        uint32_t start = d->span.offset;
+        uint32_t end = UINT32_MAX;
+        if (i + 1 < list->len) {
+            const SnDecl *next_d = SN_LIST_AT(*list, const SnDecl, i + 1);
+            if (next_d && next_d->span.offset > start) {
+                end = next_d->span.offset;
+            }
         }
-        if (offset >= d->span.offset && offset <= d->span.offset + (d->span.len ? d->span.len : 1000000)) {
+
+        if (offset >= start && offset < end) {
+            if (d->kind == SN_DECL_CLASS || d->kind == SN_DECL_STRUCT ||
+                d->kind == SN_DECL_INTERFACE || d->kind == SN_DECL_ENUM) {
+                const SnDecl *inner = find_decl_in_list(&d->members, offset);
+                if (inner) return inner;
+                const SnDecl *var_inner = find_decl_in_list(&d->variants, offset);
+                if (var_inner) return var_inner;
+            }
             return d;
         }
     }
@@ -335,6 +407,206 @@ static const SnDecl *find_decl_in_list(const SnList *list, uint32_t offset) {
 const SnDecl *lsp_find_decl_at(const LspDocAnalysis *a, uint32_t offset) {
     if (!a || !a->has_ast) return NULL;
     return find_decl_in_list(&a->unit.decls, offset);
+}
+
+static const SnDecl *find_enclosing_routine_helper(const SnList *decls, uint32_t offset, const SnDecl **out_type) {
+    if (!decls) return NULL;
+    for (size_t i = 0; i < decls->len; i++) {
+        const SnDecl *d = SN_LIST_AT(*decls, const SnDecl, i);
+        if (!d) continue;
+
+        uint32_t start = d->span.offset;
+        uint32_t end = UINT32_MAX;
+        if (i + 1 < decls->len) {
+            const SnDecl *next_d = SN_LIST_AT(*decls, const SnDecl, i + 1);
+            if (next_d && next_d->span.offset > start) {
+                end = next_d->span.offset;
+            }
+        }
+
+        if (offset >= start && offset < end) {
+            if (d->kind == SN_DECL_CLASS || d->kind == SN_DECL_STRUCT ||
+                d->kind == SN_DECL_INTERFACE || d->kind == SN_DECL_ENUM) {
+                const SnDecl *inner = find_enclosing_routine_helper(&d->members, offset, out_type);
+                if (inner) {
+                    if (out_type) *out_type = d;
+                    return inner;
+                }
+                if (out_type) *out_type = d;
+            }
+            if (d->kind == SN_DECL_FUNC || d->kind == SN_DECL_METHOD) {
+                return d;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void define_type_params_in_scope(SnChecker *c, SnScope *scope, const SnDecl *decl) {
+    if (!decl || decl->generics.len == 0) return;
+    for (size_t i = 0; i < decl->generics.len; i++) {
+        const char *name = SN_LIST_AT(decl->generics, const char, i);
+        const char *iname = sn_intern_cstr(c->intern, name);
+        SnSymbol *sym = sn_scope_define(scope, iname, SN_SYM_TYPE, NULL, decl->span);
+        if (sym) {
+            sym->value_type = sn_type_typevar(c->types, sym);
+        }
+    }
+}
+
+static void collect_statements_before_offset(SnChecker *checker, SnScope *scope, const SnStmt *s, uint32_t offset) {
+    if (!s) return;
+    if (s->span.offset >= offset) return;
+
+    if (s->kind == SN_STMT_LET || s->kind == SN_STMT_VAR) {
+        sn_check_stmt(checker, scope, (SnStmt *)s);
+    } else if (s->kind == SN_STMT_FOR) {
+        if (s->name) {
+            SnTypeRep *elem_ty = sn_type_any(checker->types);
+            if (s->expr) {
+                SnTypeRep *iter_ty = sn_check_expr(checker, scope, s->expr);
+                if (iter_ty && iter_ty->tag == SN_T_ARRAY && iter_ty->nargs >= 1 && iter_ty->args && iter_ty->args[0]) {
+                    elem_ty = iter_ty->args[0];
+                }
+            }
+            const char *iname = sn_intern_cstr(checker->intern, s->name);
+            SnSymbol *sym = sn_scope_define(scope, iname, SN_SYM_LOCAL, NULL, s->span);
+            if (sym) {
+                sym->value_type = elem_ty;
+                sym->is_mutable = 0;
+            }
+        }
+        if (s->then_br) collect_statements_before_offset(checker, scope, s->then_br, offset);
+    } else if (s->kind == SN_STMT_BLOCK) {
+        for (size_t i = 0; i < s->stmts.len; i++) {
+            const SnStmt *child = SN_LIST_AT(s->stmts, const SnStmt, i);
+            collect_statements_before_offset(checker, scope, child, offset);
+        }
+    } else if (s->kind == SN_STMT_IF) {
+        if (s->then_br) collect_statements_before_offset(checker, scope, s->then_br, offset);
+        if (s->else_br) collect_statements_before_offset(checker, scope, s->else_br, offset);
+    } else if (s->kind == SN_STMT_WHILE) {
+        if (s->then_br) collect_statements_before_offset(checker, scope, s->then_br, offset);
+    } else if (s->kind == SN_STMT_TRY) {
+        if (s->then_br) collect_statements_before_offset(checker, scope, s->then_br, offset);
+        for (size_t i = 0; i < s->catches.len; i++) {
+            const SnStmt *cat = SN_LIST_AT(s->catches, const SnStmt, i);
+            if (cat) {
+                if (cat->name) {
+                    const char *iname = sn_intern_cstr(checker->intern, cat->name);
+                    SnSymbol *sym = sn_scope_define(scope, iname, SN_SYM_LOCAL, NULL, cat->span);
+                    if (sym) {
+                        sym->value_type = sn_type_any(checker->types);
+                        sym->is_mutable = 0;
+                    }
+                }
+                collect_statements_before_offset(checker, scope, cat, offset);
+            }
+        }
+        if (s->finally_br) collect_statements_before_offset(checker, scope, s->finally_br, offset);
+    }
+}
+
+SnScope *lsp_build_scope_at(const LspDocAnalysis *a, SnChecker *checker, uint32_t offset, const SnDecl **out_enclosing_decl, const SnDecl **out_enclosing_type) {
+    if (out_enclosing_decl) *out_enclosing_decl = NULL;
+    if (out_enclosing_type) *out_enclosing_type = NULL;
+    if (!a || !checker) return NULL;
+
+    const SnDecl *enclosing_type = NULL;
+    const SnDecl *routine = find_enclosing_routine_helper(&a->unit.decls, offset, &enclosing_type);
+    if (out_enclosing_decl) *out_enclosing_decl = routine;
+    if (out_enclosing_type) *out_enclosing_type = enclosing_type;
+
+    checker->current_package = sn_intern_cstr(checker->intern, (a->unit.package && a->unit.package[0]) ? a->unit.package : "main");
+    checker->current_imports = &a->unit.imports;
+    checker->enclosing_type = enclosing_type;
+
+    SnScope *scope = (SnScope *)sn_arena_alloc(checker->arena, sizeof(SnScope));
+    sn_scope_init(scope, checker->arena, NULL);
+
+    if (!routine) {
+        return scope;
+    }
+
+    SnScope *type_params_scope = (SnScope *)sn_arena_alloc(checker->arena, sizeof(SnScope));
+    sn_scope_init(type_params_scope, checker->arena, NULL);
+    define_type_params_in_scope(checker, type_params_scope, routine);
+    if (enclosing_type) {
+        define_type_params_in_scope(checker, type_params_scope, enclosing_type);
+    }
+    checker->type_params = type_params_scope;
+
+    // Define parameters
+    for (size_t i = 0; i < routine->params.len; i++) {
+        SnParam *p = SN_LIST_AT(routine->params, SnParam, i);
+        SnTypeRep *pty = sn_check_resolve_type(checker, p->type);
+        SnSymbol *sym = sn_scope_define(scope, sn_intern_cstr(checker->intern, p->name),
+                                        SN_SYM_PARAM, NULL, p->span);
+        if (sym) {
+            sym->value_type = pty;
+            sym->is_mutable = 0;
+        }
+    }
+
+    // Define `this`
+    if (enclosing_type) {
+        const char *tname = enclosing_type->name ? enclosing_type->name : "";
+        const char *iname = sn_intern_cstr(checker->intern, tname);
+        SnScope *pkg_scope = sn_resolver_package_scope(checker->resolver, checker->current_package);
+        SnSymbol *self_sym = pkg_scope ? sn_scope_lookup(pkg_scope, iname) : NULL;
+        if (!self_sym && checker->resolver->prelude_scope) {
+            self_sym = sn_scope_lookup(checker->resolver->prelude_scope, iname);
+        }
+        SnTypeRep *self_ty = self_sym ? sn_type_named(checker->types, self_sym, NULL, 0)
+                                      : sn_type_error(checker->types);
+        SnSymbol *this_sym = sn_scope_define(scope, sn_intern_cstr(checker->intern, "this"),
+                                             SN_SYM_PARAM, NULL, routine->span);
+        if (this_sym) {
+            this_sym->value_type = self_ty;
+            this_sym->is_mutable = 0;
+        }
+        if (routine->name && strcmp(routine->name, "new") == 0) {
+            checker->current_return_type = self_ty;
+        } else {
+            checker->current_return_type = sn_check_resolve_type(checker, routine->ret);
+        }
+    } else {
+        checker->current_return_type = sn_check_resolve_type(checker, routine->ret);
+    }
+
+    // Collect statements prior to cursor offset
+    if (routine->body && routine->body->stmts.len > 0) {
+        for (size_t i = 0; i < routine->body->stmts.len; i++) {
+            const SnStmt *s = SN_LIST_AT(routine->body->stmts, const SnStmt, i);
+            collect_statements_before_offset(checker, scope, s, offset);
+        }
+    }
+
+    return scope;
+}
+
+SnTypeRep *lsp_infer_expr_type_at(const LspDocAnalysis *a, SnChecker *checker, SnScope *local, const char *expr_str) {
+    if (!a || !checker || !expr_str || !expr_str[0]) return NULL;
+
+    size_t len = strlen(expr_str);
+    char *buf = sn_arena_strndup(checker->arena, expr_str, len);
+
+    SnDiagSink sink;
+    sn_diag_init(&sink, a->path ? a->path : "", buf, len);
+    sink.out = NULL;
+    sink.quiet = 1;
+
+    SnTokenVec toks;
+    memset(&toks, 0, sizeof(toks));
+    if (sn_lex(checker->arena, &sink, buf, len, &toks) != 0) {
+        return NULL;
+    }
+
+    SnExpr *e = sn_parse_expr_only(checker->arena, &sink, &toks);
+    if (!e) return NULL;
+
+    SnTypeRep *ty = sn_check_expr(checker, local, e);
+    return ty;
 }
 
 const SnSymbol *lsp_find_symbol_at(const LspDocAnalysis *a, const LspDocument *doc, uint32_t offset, const char **out_name) {
@@ -347,18 +619,37 @@ const SnSymbol *lsp_find_symbol_at(const LspDocAnalysis *a, const LspDocument *d
     if (out_name) *out_name = tok->text;
 
     const char *name = tok->text;
+    const char *iname = sn_intern_cstr((SnInternTable *)&a->intern, name);
+
+    // 0. Check local scope in enclosing routine
+    SnDiagSink null_diag;
+    sn_diag_init(&null_diag, a->path ? a->path : "", "", 0);
+    null_diag.out = NULL;
+    null_diag.quiet = 1;
+
+    SnChecker checker;
+    sn_checker_init(&checker, (SnArena *)&a->arena, (SnInternTable *)&a->intern,
+                    &null_diag, (SnResolver *)&a->resolver, (SnTypeTable *)&a->types);
+    const SnDecl *enclosing_decl = NULL;
+    const SnDecl *enclosing_type = NULL;
+    SnScope *local_scope = lsp_build_scope_at(a, &checker, offset, &enclosing_decl, &enclosing_type);
+    if (local_scope) {
+        SnSymbol *s = sn_scope_lookup(local_scope, iname);
+        if (s) return s;
+    }
+
     const char *pkg_name = a->unit.package ? a->unit.package : "";
 
     // 1. Check current package scope
     SnScope *pkg_scope = sn_resolver_package_scope(&a->resolver, pkg_name);
     if (pkg_scope) {
-        SnSymbol *s = sn_scope_lookup(pkg_scope, name);
+        SnSymbol *s = sn_scope_lookup(pkg_scope, iname);
         if (s) return s;
     }
 
     // 2. Check prelude scope
     if (a->resolver.prelude_scope) {
-        SnSymbol *s = sn_scope_lookup(a->resolver.prelude_scope, name);
+        SnSymbol *s = sn_scope_lookup(a->resolver.prelude_scope, iname);
         if (s) return s;
     }
 
@@ -367,14 +658,14 @@ const SnSymbol *lsp_find_symbol_at(const LspDocAnalysis *a, const LspDocument *d
         const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
         SnScope *imp_scope = sn_resolver_package_scope(&a->resolver, imp);
         if (imp_scope) {
-            SnSymbol *s = sn_scope_lookup(imp_scope, name);
+            SnSymbol *s = sn_scope_lookup(imp_scope, iname);
             if (s) return s;
         }
     }
 
     // 4. Check all type member scopes
     for (SnTypeScopeEntry *te = a->resolver.type_scopes; te; te = te->next) {
-        SnSymbol *s = sn_scope_lookup_local(te->member_scope, name);
+        SnSymbol *s = sn_scope_lookup_local(te->member_scope, iname);
         if (s) return s;
     }
 

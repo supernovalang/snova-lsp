@@ -6,6 +6,7 @@
 #endif
 
 #include "lsp_completion.h"
+#include "lsp_analysis.h"
 #include "json.h"
 
 #include <stdio.h>
@@ -98,7 +99,6 @@ static void complist_add(CompList *list, const char *label, LspCompletionKind ki
 
 /* ── Ranking & Fuzzy Matching (Gopls & Rust-Analyzer tier ranking) ────────── */
 
-/* Check if acronym matches camelCase or snake_case initials (e.g. "ghr" -> "getHttpRequest") */
 static bool acronym_matches(const char *label, const char *prefix) {
     if (!label || !prefix || !prefix[0]) return false;
     size_t pi = 0;
@@ -116,7 +116,6 @@ static bool acronym_matches(const char *label, const char *prefix) {
     return (pi == plen);
 }
 
-/* Subsequence match: all prefix chars appear in label in order (case-insensitive) */
 static bool subsequence_matches(const char *label, const char *prefix) {
     if (!label || !prefix || !prefix[0]) return false;
     size_t pi = 0;
@@ -129,57 +128,52 @@ static bool subsequence_matches(const char *label, const char *prefix) {
     return (pi == plen);
 }
 
-/* Match scoring tiers based on gopls / rust-analyzer */
 static int compute_match_bonus(const char *label, const char *prefix) {
-    if (!prefix || !prefix[0]) return 0; /* Empty prefix matches everything with base bonus 0 */
+    if (!prefix || !prefix[0]) return 0;
     if (!label) return -1;
 
     size_t plen = strlen(prefix);
 
-    /* Tier 1: Exact case-sensitive match */
+    // Tier 1: Exact case-sensitive match
     if (strcmp(label, prefix) == 0) return 120;
 
-    /* Tier 2: Exact case-insensitive match */
+    // Tier 2: Exact case-insensitive match
     if (strcasecmp(label, prefix) == 0) return 100;
 
-    /* Tier 3: Prefix case-sensitive match */
+    // Tier 3: Prefix case-sensitive match
     if (strncmp(label, prefix, plen) == 0) return 80;
 
-    /* Tier 4: Prefix case-insensitive match */
+    // Tier 4: Prefix case-insensitive match
     if (strncasecmp(label, prefix, plen) == 0) return 60;
 
-    /* Tier 5: Acronym match (camelCase humps) */
+    // Tier 5: Acronym match (camelCase humps)
     if (acronym_matches(label, prefix)) return 35;
 
-    /* Tier 6: Subsequence fuzzy match */
+    // Tier 6: Subsequence fuzzy match
     if (subsequence_matches(label, prefix)) return 20;
 
-    /* Tier 7: Substring match */
+    // Tier 7: Substring match
     if (strcasestr(label, prefix) != NULL) return 15;
 
-    /* No match */
     return -1;
 }
 
-/* Insertion sort by finalScore descending, with length and alphabetical tie-breaking */
 static void rank_and_sort_candidates(CompList *list, const char *prefix) {
     if (!list || list->len == 0) return;
 
-    /* 1. Calculate scores and filter out non-matching candidates */
+    // 1. Calculate scores and filter out non-matching candidates
     for (size_t i = 0; i < list->len; i++) {
         CompItem *ci = &list->items[i];
         int mb = compute_match_bonus(ci->label, prefix);
         if (prefix && prefix[0] && mb < 0) {
-            /* Mark as discarded */
             ci->final_score = -1;
             continue;
         }
         ci->match_bonus = (mb >= 0) ? mb : 0;
-        /* Gopls three-tier formula: finalScore = baseScore + (typeBonus * 3) + matchBonus */
         ci->final_score = ci->base_score + (ci->type_bonus * 3) + ci->match_bonus;
     }
 
-    /* 2. Compact valid items */
+    // 2. Compact valid items
     size_t dst = 0;
     for (size_t src = 0; src < list->len; src++) {
         if (list->items[src].final_score >= 0) {
@@ -188,7 +182,6 @@ static void rank_and_sort_candidates(CompList *list, const char *prefix) {
             }
             dst++;
         } else {
-            /* Free discarded item */
             if (list->items[src].label) free(list->items[src].label);
             if (list->items[src].detail) free(list->items[src].detail);
             if (list->items[src].doc) free(list->items[src].doc);
@@ -199,7 +192,7 @@ static void rank_and_sort_candidates(CompList *list, const char *prefix) {
     }
     list->len = dst;
 
-    /* 3. Insertion sort */
+    // 3. Insertion sort
     for (size_t i = 1; i < list->len; i++) {
         CompItem key = list->items[i];
         size_t j = i;
@@ -209,7 +202,6 @@ static void rank_and_sort_candidates(CompList *list, const char *prefix) {
             if (key.final_score > prev->final_score) {
                 swap = true;
             } else if (key.final_score == prev->final_score) {
-                /* Tie breaker: shorter label first, then alphabetical */
                 size_t klen = strlen(key.label);
                 size_t plen = strlen(prev->label);
                 if (klen < plen) {
@@ -237,10 +229,7 @@ typedef enum {
     CTX_MEMBER,
     CTX_TYPE_POS,
     CTX_DECORATOR,
-    CTX_IMPORT_LINE,
-    CTX_ARGUMENT,
-    CTX_STRUCT_LIT,
-    CTX_MATCH_ARM
+    CTX_IMPORT_LINE
 } ComplContext;
 
 static void extract_line_info(const char *doc_text, uint32_t target_line, uint32_t target_col,
@@ -256,7 +245,6 @@ static void extract_line_info(const char *doc_text, uint32_t target_line, uint32
 
     if (!doc_text) return;
 
-    // Find target line in document
     const char *p = doc_text;
     uint32_t cur_line = 0;
     while (*p && cur_line < target_line) {
@@ -264,7 +252,6 @@ static void extract_line_info(const char *doc_text, uint32_t target_line, uint32
         p++;
     }
 
-    // Copy current line
     size_t li = 0;
     while (*p && *p != '\r' && *p != '\n' && li + 1 < line_buf_sz) {
         line_buf[li++] = *p++;
@@ -274,14 +261,12 @@ static void extract_line_info(const char *doc_text, uint32_t target_line, uint32
     size_t col = target_col;
     if (col > li) col = li;
 
-    // Check following paren
     size_t fp = col;
     while (fp < li && (line_buf[fp] == ' ' || line_buf[fp] == '\t')) fp++;
     if (fp < li && line_buf[fp] == '(') {
         *out_has_following_paren = true;
     }
 
-    // Extract prefix immediately before cursor
     size_t start = col;
     while (start > 0) {
         char c = line_buf[start - 1];
@@ -296,24 +281,39 @@ static void extract_line_info(const char *doc_text, uint32_t target_line, uint32
     memcpy(prefix_buf, line_buf + start, plen);
     prefix_buf[plen] = '\0';
 
-    // Check preceding characters
     size_t prec = start;
     while (prec > 0 && (line_buf[prec - 1] == ' ' || line_buf[prec - 1] == '\t')) prec--;
 
     if (prec > 0 && line_buf[prec - 1] == '.') {
         *out_ctx = CTX_MEMBER;
-        // Extract receiver before dot
         size_t r_end = prec - 1;
         while (r_end > 0 && (line_buf[r_end - 1] == ' ' || line_buf[r_end - 1] == '\t')) r_end--;
+        if (r_end > 0 && line_buf[r_end - 1] == '?') {
+            r_end--;
+            while (r_end > 0 && (line_buf[r_end - 1] == ' ' || line_buf[r_end - 1] == '\t')) r_end--;
+        }
+
+        int paren_depth = 0;
+        int bracket_depth = 0;
         size_t r_start = r_end;
         while (r_start > 0) {
             char c = line_buf[r_start - 1];
-            if (isalnum((unsigned char)c) || c == '_' || c == ')' || c == ']') {
-                r_start--;
-            } else {
-                break;
+            if (c == ')') paren_depth++;
+            else if (c == '(') {
+                if (paren_depth > 0) paren_depth--;
+                else break;
+            } else if (c == ']') bracket_depth++;
+            else if (c == '[') {
+                if (bracket_depth > 0) bracket_depth--;
+                else break;
+            } else if (paren_depth == 0 && bracket_depth == 0) {
+                if (!isalnum((unsigned char)c) && c != '_' && c != '.' && c != '?' && c != '$' && c != '"' && c != '\'') {
+                    break;
+                }
             }
+            r_start--;
         }
+        while (r_start < r_end && (line_buf[r_start] == ' ' || line_buf[r_start] == '\t')) r_start++;
         size_t rlen = r_end - r_start;
         if (rlen >= receiver_buf_sz) rlen = receiver_buf_sz - 1;
         memcpy(receiver_buf, line_buf + r_start, rlen);
@@ -326,7 +326,6 @@ static void extract_line_info(const char *doc_text, uint32_t target_line, uint32
         return;
     }
 
-    // Check if line starts with import / using
     const char *trimmed = line_buf;
     while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
     if (strncmp(trimmed, "import ", 7) == 0 || strncmp(trimmed, "using ", 6) == 0) {
@@ -334,14 +333,68 @@ static void extract_line_info(const char *doc_text, uint32_t target_line, uint32
         return;
     }
 
-    // Check if after ':' or 'as' or 'is' or '<'
-    if (prec > 0 && line_buf[prec - 1] == ':') {
+    if (prec > 0 && (line_buf[prec - 1] == ':' || line_buf[prec - 1] == '<')) {
         *out_ctx = CTX_TYPE_POS;
         return;
     }
-    if (prec > 0 && line_buf[prec - 1] == '<') {
-        *out_ctx = CTX_TYPE_POS;
+}
+
+/* ── Type Formatting Helpers ──────────────────────────────────────────────── */
+
+static void format_typerep_string(const SnTypeRep *ty, char *out, size_t out_sz) {
+    if (!ty) {
+        snprintf(out, out_sz, "any");
         return;
+    }
+    switch (ty->tag) {
+        case SN_T_UNIT: snprintf(out, out_sz, "unit"); break;
+        case SN_T_BOOL: snprintf(out, out_sz, "bool"); break;
+        case SN_T_INT: snprintf(out, out_sz, "int"); break;
+        case SN_T_LONG: snprintf(out, out_sz, "long"); break;
+        case SN_T_DOUBLE: snprintf(out, out_sz, "double"); break;
+        case SN_T_DECIMAL: snprintf(out, out_sz, "decimal"); break;
+        case SN_T_FLOAT: snprintf(out, out_sz, "float"); break;
+        case SN_T_BYTE: snprintf(out, out_sz, "byte"); break;
+        case SN_T_CHAR: snprintf(out, out_sz, "char"); break;
+        case SN_T_STRING: snprintf(out, out_sz, "string"); break;
+        case SN_T_ANY: snprintf(out, out_sz, "any"); break;
+        case SN_T_ERROR: snprintf(out, out_sz, "any"); break;
+        case SN_T_ARRAY: {
+            char elem_str[128] = "any";
+            if (ty->nargs > 0 && ty->args && ty->args[0]) {
+                format_typerep_string(ty->args[0], elem_str, sizeof(elem_str));
+            }
+            snprintf(out, out_sz, "Array<%s>", elem_str);
+            break;
+        }
+        case SN_T_NAMED: {
+            const char *name = (ty->decl && ty->decl->name) ? ty->decl->name : "Type";
+            if (ty->nargs > 0 && ty->args) {
+                char args_buf[256] = "";
+                for (uint32_t i = 0; i < ty->nargs; i++) {
+                    char a_str[64];
+                    format_typerep_string(ty->args[i], a_str, sizeof(a_str));
+                    if (i > 0) strcat(args_buf, ", ");
+                    strcat(args_buf, a_str);
+                }
+                snprintf(out, out_sz, "%s<%s>", name, args_buf);
+            } else {
+                snprintf(out, out_sz, "%s", name);
+            }
+            break;
+        }
+        case SN_T_TYPEVAR:
+            snprintf(out, out_sz, "%s", (ty->decl && ty->decl->name) ? ty->decl->name : "T");
+            break;
+        case SN_T_FUNC: {
+            char ret_str[64] = "unit";
+            if (ty->ret) format_typerep_string(ty->ret, ret_str, sizeof(ret_str));
+            snprintf(out, out_sz, "(...) -> %s", ret_str);
+            break;
+        }
+        default:
+            snprintf(out, out_sz, "any");
+            break;
     }
 }
 
@@ -386,7 +439,7 @@ static void add_keywords_and_snippets(CompList *list, ComplContext ctx, bool has
     complist_add(list, "Array", LSP_COMPLETION_CLASS, "class Array<T>", "Fixed-size or slice array", "Array<${1:T}>", 2, NULL, type_score, type_bonus);
 
     if (ctx == CTX_TYPE_POS) {
-        return; // Only types in type position
+        return;
     }
 
     // Builtin Functions & Constructors
@@ -413,7 +466,7 @@ static void add_keywords_and_snippets(CompList *list, ComplContext ctx, bool has
     complist_add(list, "null", LSP_COMPLETION_VALUE, "null", "Null reference", "null", 1, NULL, 65, 0);
     complist_add(list, "this", LSP_COMPLETION_VALUE, "this", "Current instance reference", "this", 1, NULL, 85, 0);
 
-    // Keywords (Base score 40 so locals and members rank higher)
+    // Keywords & Snippets
     complist_add(list, "let", LSP_COMPLETION_KEYWORD, "keyword", "Immutable local binding", "let ${1:name} = ${2:value};", 2, NULL, 40, 0);
     complist_add(list, "var", LSP_COMPLETION_KEYWORD, "keyword", "Mutable variable binding", "var ${1:name} = ${2:value};", 2, NULL, 40, 0);
     complist_add(list, "const", LSP_COMPLETION_KEYWORD, "keyword", "Compile-time constant", "const ${1:NAME}: ${2:Type} = ${3:value};", 2, NULL, 40, 0);
@@ -444,289 +497,221 @@ static void add_keywords_and_snippets(CompList *list, ComplContext ctx, bool has
     complist_add(list, "package", LSP_COMPLETION_KEYWORD, "keyword", "Package declaration", "package ${1:name};", 2, NULL, 35, 0);
 }
 
-/* ── Scope Analysis: Local Variables & Parameters ─────────────────────────── */
+/* ── Builtin Type Members ─────────────────────────────────────────────────── */
 
-static void collect_scope_locals(CompList *list, const char *doc_text, uint32_t cursor_line, bool has_following_paren) {
-    (void)has_following_paren;
-    if (!doc_text) return;
+static void add_array_builtin_members(CompList *list, bool has_following_paren) {
+    int cf = has_following_paren ? 1 : 2;
 
-    // Scan lines up to cursor_line for parameters of enclosing routine
-    char last_params[512] = {0};
-    const char *p = doc_text;
-    uint32_t cl = 0;
-    while (*p && cl <= cursor_line) {
-        char line[4096] = {0};
-        size_t n = 0;
-        while (p[n] && p[n] != '\n' && n + 1 < sizeof(line)) { line[n] = p[n]; n++; }
-        line[n] = '\0';
-        p += n;
-        if (*p == '\n') p++;
-
-        const char *trimmed = line;
-        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-
-        if (strncmp(trimmed, "func ", 5) == 0 || strncmp(trimmed, "method ", 7) == 0 ||
-            strncmp(trimmed, "async func ", 11) == 0 || strncmp(trimmed, "async method ", 13) == 0 ||
-            strncmp(trimmed, "constructor(", 12) == 0 || strncmp(trimmed, "public constructor(", 19) == 0) {
-            const char *op = strchr(trimmed, '(');
-            const char *cp = op ? strrchr(trimmed, ')') : NULL;
-            if (op && cp && cp > op) {
-                size_t len = (size_t)(cp - op - 1);
-                if (len >= sizeof(last_params)) len = sizeof(last_params) - 1;
-                memcpy(last_params, op + 1, len);
-                last_params[len] = '\0';
-            }
-        }
-        cl++;
-    }
-
-    if (last_params[0]) {
-        char params_copy[512];
-        strncpy(params_copy, last_params, sizeof(params_copy) - 1);
-        params_copy[sizeof(params_copy) - 1] = '\0';
-        char *token = strtok(params_copy, ",");
-        while (token) {
-            while (*token == ' ' || *token == '\t') token++;
-            char pname[128] = {0}, ptype[128] = {0};
-            size_t i = 0;
-            while (token[i] && token[i] != ':' && token[i] != ' ' && token[i] != '=' && i < sizeof(pname) - 1) {
-                pname[i] = token[i]; i++;
-            }
-            pname[i] = '\0';
-
-            const char *colon = strchr(token, ':');
-            if (colon) {
-                colon++;
-                while (*colon == ' ') colon++;
-                size_t j = 0;
-                while (colon[j] && colon[j] != ',' && colon[j] != '=' && j < sizeof(ptype) - 1) {
-                    ptype[j] = colon[j]; j++;
-                }
-                while (j > 0 && ptype[j - 1] == ' ') ptype[--j] = '\0';
-            }
-
-            if (pname[0]) {
-                char detail[512];
-                if (ptype[0]) snprintf(detail, sizeof(detail), "param %s: %s", pname, ptype);
-                else snprintf(detail, sizeof(detail), "param %s", pname);
-                /* Highest base score: 95 for parameters */
-                complist_add(list, pname, LSP_COMPLETION_VARIABLE, detail, "Function/method parameter", pname, 1, NULL, 95, 15);
-            }
-            token = strtok(NULL, ",");
-        }
-    }
-
-    // Scan lines up to cursor_line for local let / var declarations
-    p = doc_text;
-    cl = 0;
-    while (*p && cl <= cursor_line) {
-        char line[4096] = {0};
-        size_t n = 0;
-        while (p[n] && p[n] != '\n' && n + 1 < sizeof(line)) { line[n] = p[n]; n++; }
-        line[n] = '\0';
-        p += n;
-        if (*p == '\n') p++;
-
-        const char *trimmed = line;
-        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-
-        char vname[128] = {0};
-        bool is_var = false;
-        if (strncmp(trimmed, "let ", 4) == 0) {
-            trimmed += 4;
-        } else if (strncmp(trimmed, "var ", 4) == 0) {
-            trimmed += 4;
-            is_var = true;
-        } else {
-            cl++;
-            continue;
-        }
-
-        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-        size_t vi = 0;
-        while (trimmed[vi] && (isalnum((unsigned char)trimmed[vi]) || trimmed[vi] == '_') && vi < sizeof(vname) - 1) {
-            vname[vi] = trimmed[vi]; vi++;
-        }
-        vname[vi] = '\0';
-
-        if (vname[0]) {
-            char vtype[128] = {0};
-            const char *colon = strchr(trimmed, ':');
-            if (colon) {
-                colon++;
-                while (*colon == ' ') colon++;
-                size_t j = 0;
-                while (colon[j] && colon[j] != '=' && colon[j] != ';' && j < sizeof(vtype) - 1) {
-                    vtype[j] = colon[j]; j++;
-                }
-                while (j > 0 && vtype[j - 1] == ' ') vtype[--j] = '\0';
-            }
-
-            char detail[512];
-            const char *kw = is_var ? "var" : "let";
-            if (vtype[0]) snprintf(detail, sizeof(detail), "%s %s: %s", kw, vname, vtype);
-            else snprintf(detail, sizeof(detail), "%s %s", kw, vname);
-
-            /* High base score: 90 for local variables */
-            complist_add(list, vname, LSP_COMPLETION_VARIABLE, detail, "Local variable", vname, 1, NULL, 90, 10);
-        }
-        cl++;
-    }
+    complist_add(list, "length", LSP_COMPLETION_FIELD, "let length: int", "Number of elements in array", "length", 1, NULL, 90, 0);
+    complist_add(list, "len", LSP_COMPLETION_METHOD, "method len(): int", "Number of elements in array", has_following_paren ? "len" : "len()", 1, NULL, 90, 0);
+    complist_add(list, "push", LSP_COMPLETION_METHOD, "method push(item: T): unit", "Appends an element to the end", has_following_paren ? "push" : "push($1)", cf, NULL, 90, 0);
+    complist_add(list, "get", LSP_COMPLETION_METHOD, "method get(index: int): T", "Gets element at index", has_following_paren ? "get" : "get(${1:index})", cf, NULL, 90, 0);
+    complist_add(list, "set", LSP_COMPLETION_METHOD, "method set(index: int, item: T): unit", "Sets element at index", has_following_paren ? "set" : "set(${1:index}, ${2:item})", cf, NULL, 90, 0);
+    complist_add(list, "map", LSP_COMPLETION_METHOD, "method map(fn: (T) -> U): Array<U>", "Transforms each element", has_following_paren ? "map" : "map(${1:item} -> $0)", cf, NULL, 90, 0);
+    complist_add(list, "flatMap", LSP_COMPLETION_METHOD, "method flatMap(fn: (T) -> Array<U>): Array<U>", "Maps and flattens result array", has_following_paren ? "flatMap" : "flatMap(${1:item} -> $0)", cf, NULL, 90, 0);
+    complist_add(list, "filter", LSP_COMPLETION_METHOD, "method filter(fn: (T) -> bool): Array<T>", "Filters elements matching predicate", has_following_paren ? "filter" : "filter(${1:item} -> $0)", cf, NULL, 90, 0);
+    complist_add(list, "forEach", LSP_COMPLETION_METHOD, "method forEach(fn: (T) -> unit): unit", "Iterates over each element", has_following_paren ? "forEach" : "forEach(${1:item} -> $0)", cf, NULL, 90, 0);
+    complist_add(list, "reduce", LSP_COMPLETION_METHOD, "method reduce(init: U, fn: (U, T) -> U): U", "Reduces array to a single value", has_following_paren ? "reduce" : "reduce(${1:init}, (${2:acc}, ${3:item}) -> $0)", cf, NULL, 90, 0);
+    complist_add(list, "take", LSP_COMPLETION_METHOD, "method take(count: int): Array<T>", "Takes first N elements", has_following_paren ? "take" : "take(${1:count})", cf, NULL, 90, 0);
+    complist_add(list, "drop", LSP_COMPLETION_METHOD, "method drop(count: int): Array<T>", "Drops first N elements", has_following_paren ? "drop" : "drop(${1:count})", cf, NULL, 90, 0);
+    complist_add(list, "first", LSP_COMPLETION_METHOD, "method first(): T", "Returns the first element", has_following_paren ? "first" : "first()", 1, NULL, 90, 0);
+    complist_add(list, "last", LSP_COMPLETION_METHOD, "method last(): T", "Returns the last element", has_following_paren ? "last" : "last()", 1, NULL, 90, 0);
+    complist_add(list, "join", LSP_COMPLETION_METHOD, "method join(separator: string): string", "Joins elements with separator", has_following_paren ? "join" : "join(\"${1:,}\")", cf, NULL, 90, 0);
+    complist_add(list, "slice", LSP_COMPLETION_METHOD, "method slice(start: int, end: int): Array<T>", "Returns sub-array slice", has_following_paren ? "slice" : "slice(${1:start}, ${2:end})", cf, NULL, 90, 0);
+    complist_add(list, "clear", LSP_COMPLETION_METHOD, "method clear(): unit", "Removes all elements", has_following_paren ? "clear" : "clear()", 1, NULL, 90, 0);
+    complist_add(list, "concurrentMapping", LSP_COMPLETION_METHOD, "method concurrentMapping(fn: (T) -> U): Array<U>", "Parallel map across tasks", has_following_paren ? "concurrentMapping" : "concurrentMapping(${1:item} -> $0)", cf, NULL, 85, 0);
+    complist_add(list, "concurrentMappingWith", LSP_COMPLETION_METHOD, "method concurrentMappingWith(workers: int, fn: (T) -> U): Array<U>", "Parallel map with fixed workers", has_following_paren ? "concurrentMappingWith" : "concurrentMappingWith(${1:workers}, ${2:item} -> $0)", cf, NULL, 85, 0);
+    complist_add(list, "concurrentForEach", LSP_COMPLETION_METHOD, "method concurrentForEach(fn: (T) -> unit): unit", "Parallel for-each", has_following_paren ? "concurrentForEach" : "concurrentForEach(${1:item} -> $0)", cf, NULL, 85, 0);
 }
 
-/* ── Decl & Symbol Collection ─────────────────────────────────────────────── */
+static void add_string_builtin_members(CompList *list, bool has_following_paren) {
+    int cf = has_following_paren ? 1 : 2;
 
-static void collect_decl_symbols(CompList *list, const SnDecl *d, ComplContext ctx, bool has_following_paren) {
-    if (!d || !d->name) return;
+    complist_add(list, "length", LSP_COMPLETION_FIELD, "let length: int", "Number of characters in string", "length", 1, NULL, 90, 0);
+    complist_add(list, "len", LSP_COMPLETION_METHOD, "method len(): int", "Number of characters in string", has_following_paren ? "len" : "len()", 1, NULL, 90, 0);
+    complist_add(list, "toString", LSP_COMPLETION_METHOD, "method toString(): string", "String representation", has_following_paren ? "toString" : "toString()", 1, NULL, 90, 0);
+    complist_add(list, "asString", LSP_COMPLETION_METHOD, "method asString(): string", "String representation", has_following_paren ? "asString" : "asString()", 1, NULL, 90, 0);
+    complist_add(list, "charAt", LSP_COMPLETION_METHOD, "method charAt(index: int): string", "Character at index", has_following_paren ? "charAt" : "charAt(${1:index})", cf, NULL, 90, 0);
+    complist_add(list, "substring", LSP_COMPLETION_METHOD, "method substring(start: int, end: int): string", "Sub-string extraction", has_following_paren ? "substring" : "substring(${1:start}, ${2:end})", cf, NULL, 90, 0);
+    complist_add(list, "trim", LSP_COMPLETION_METHOD, "method trim(): string", "Removes leading and trailing whitespace", has_following_paren ? "trim" : "trim()", 1, NULL, 90, 0);
+    complist_add(list, "trimStart", LSP_COMPLETION_METHOD, "method trimStart(): string", "Removes leading whitespace", has_following_paren ? "trimStart" : "trimStart()", 1, NULL, 90, 0);
+    complist_add(list, "trimEnd", LSP_COMPLETION_METHOD, "method trimEnd(): string", "Removes trailing whitespace", has_following_paren ? "trimEnd" : "trimEnd()", 1, NULL, 90, 0);
+    complist_add(list, "startsWith", LSP_COMPLETION_METHOD, "method startsWith(prefix: string): bool", "Checks if string starts with prefix", has_following_paren ? "startsWith" : "startsWith(\"${1:prefix}\")", cf, NULL, 90, 0);
+    complist_add(list, "endsWith", LSP_COMPLETION_METHOD, "method endsWith(suffix: string): bool", "Checks if string ends with suffix", has_following_paren ? "endsWith" : "endsWith(\"${1:suffix}\")", cf, NULL, 90, 0);
+    complist_add(list, "contains", LSP_COMPLETION_METHOD, "method contains(sub: string): bool", "Checks if string contains substring", has_following_paren ? "contains" : "contains(\"${1:sub}\")", cf, NULL, 90, 0);
+    complist_add(list, "indexOf", LSP_COMPLETION_METHOD, "method indexOf(sub: string): int", "Finds index of substring", has_following_paren ? "indexOf" : "indexOf(\"${1:sub}\")", cf, NULL, 90, 0);
+    complist_add(list, "lastIndexOf", LSP_COMPLETION_METHOD, "method lastIndexOf(sub: string): int", "Finds last index of substring", has_following_paren ? "lastIndexOf" : "lastIndexOf(\"${1:sub}\")", cf, NULL, 90, 0);
+    complist_add(list, "split", LSP_COMPLETION_METHOD, "method split(separator: string): Array<string>", "Splits string into array", has_following_paren ? "split" : "split(\"${1:,}\")", cf, NULL, 90, 0);
+    complist_add(list, "replace", LSP_COMPLETION_METHOD, "method replace(target: string, replacement: string): string", "Replaces occurrences", has_following_paren ? "replace" : "replace(\"${1:target}\", \"${2:replacement}\")", cf, NULL, 90, 0);
+    complist_add(list, "isEmpty", LSP_COMPLETION_METHOD, "method isEmpty(): bool", "Checks if string is empty", has_following_paren ? "isEmpty" : "isEmpty()", 1, NULL, 90, 0);
+}
 
-    LspCompletionKind kind = LSP_COMPLETION_VARIABLE;
-    const char *kind_str = "declaration";
-    int base_score = 80;
-    int type_bonus = 0;
+static void add_option_builtin_members(CompList *list, bool has_following_paren) {
+    int cf = has_following_paren ? 1 : 2;
+    complist_add(list, "isSome", LSP_COMPLETION_METHOD, "method isSome(): bool", "Returns true if Option contains a value", has_following_paren ? "isSome" : "isSome()", 1, NULL, 90, 0);
+    complist_add(list, "isNone", LSP_COMPLETION_METHOD, "method isNone(): bool", "Returns true if Option is None", has_following_paren ? "isNone" : "isNone()", 1, NULL, 90, 0);
+    complist_add(list, "unwrap", LSP_COMPLETION_METHOD, "method unwrap(): T", "Unwraps the contained value or throws", has_following_paren ? "unwrap" : "unwrap()", 1, NULL, 90, 0);
+    complist_add(list, "unwrapOr", LSP_COMPLETION_METHOD, "method unwrapOr(default: T): T", "Unwraps value or returns default value", has_following_paren ? "unwrapOr" : "unwrapOr(${1:default})", cf, NULL, 90, 0);
+    complist_add(list, "map", LSP_COMPLETION_METHOD, "method map(fn: (T) -> U): Option<U>", "Transforms contained value with function", has_following_paren ? "map" : "map(${1:item} -> $0)", cf, NULL, 90, 0);
+    complist_add(list, "andThen", LSP_COMPLETION_METHOD, "method andThen(fn: (T) -> Option<U>): Option<U>", "Chains Option-returning operations", has_following_paren ? "andThen" : "andThen(${1:item} -> $0)", cf, NULL, 90, 0);
+}
 
-    switch (d->kind) {
-        case SN_DECL_CLASS:
-            kind = LSP_COMPLETION_CLASS;
-            kind_str = "class";
-            type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
-            break;
-        case SN_DECL_STRUCT:
-            kind = LSP_COMPLETION_STRUCT;
-            kind_str = "struct";
-            type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
-            break;
-        case SN_DECL_INTERFACE:
-            kind = LSP_COMPLETION_INTERFACE;
-            kind_str = "interface";
-            type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
-            break;
-        case SN_DECL_ENUM:
-            kind = LSP_COMPLETION_ENUM;
-            kind_str = "enum";
-            type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
-            break;
-        case SN_DECL_FUNC:
-            kind = LSP_COMPLETION_FUNCTION;
-            kind_str = "func";
-            break;
-        case SN_DECL_METHOD:
+static void add_result_builtin_members(CompList *list, bool has_following_paren) {
+    int cf = has_following_paren ? 1 : 2;
+    complist_add(list, "isOk", LSP_COMPLETION_METHOD, "method isOk(): bool", "Returns true if Result is Ok", has_following_paren ? "isOk" : "isOk()", 1, NULL, 90, 0);
+    complist_add(list, "isErr", LSP_COMPLETION_METHOD, "method isErr(): bool", "Returns true if Result is Err", has_following_paren ? "isErr" : "isErr()", 1, NULL, 90, 0);
+    complist_add(list, "unwrap", LSP_COMPLETION_METHOD, "method unwrap(): T", "Unwraps Ok value or throws", has_following_paren ? "unwrap" : "unwrap()", 1, NULL, 90, 0);
+    complist_add(list, "unwrapErr", LSP_COMPLETION_METHOD, "method unwrapErr(): E", "Unwraps Err error value or throws", has_following_paren ? "unwrapErr" : "unwrapErr()", 1, NULL, 90, 0);
+    complist_add(list, "map", LSP_COMPLETION_METHOD, "method map(fn: (T) -> U): Result<U, E>", "Transforms Ok value with function", has_following_paren ? "map" : "map(${1:item} -> $0)", cf, NULL, 90, 0);
+}
+
+static void add_map_builtin_members(CompList *list, bool has_following_paren) {
+    int cf = has_following_paren ? 1 : 2;
+    complist_add(list, "get", LSP_COMPLETION_METHOD, "method get(key: K): Option<V>", "Gets value by key", has_following_paren ? "get" : "get(${1:key})", cf, NULL, 90, 0);
+    complist_add(list, "set", LSP_COMPLETION_METHOD, "method set(key: K, val: V): unit", "Sets value for key", has_following_paren ? "set" : "set(${1:key}, ${2:val})", cf, NULL, 90, 0);
+    complist_add(list, "has", LSP_COMPLETION_METHOD, "method has(key: K): bool", "Checks if key exists in map", has_following_paren ? "has" : "has(${1:key})", cf, NULL, 90, 0);
+    complist_add(list, "remove", LSP_COMPLETION_METHOD, "method remove(key: K): Option<V>", "Removes key from map", has_following_paren ? "remove" : "remove(${1:key})", cf, NULL, 90, 0);
+    complist_add(list, "len", LSP_COMPLETION_METHOD, "method len(): int", "Number of entries in map", has_following_paren ? "len" : "len()", 1, NULL, 90, 0);
+    complist_add(list, "clear", LSP_COMPLETION_METHOD, "method clear(): unit", "Removes all entries", has_following_paren ? "clear" : "clear()", 1, NULL, 90, 0);
+    complist_add(list, "keys", LSP_COMPLETION_METHOD, "method keys(): Array<K>", "Returns array of all keys", has_following_paren ? "keys" : "keys()", 1, NULL, 90, 0);
+    complist_add(list, "values", LSP_COMPLETION_METHOD, "method values(): Array<V>", "Returns array of all values", has_following_paren ? "values" : "values()", 1, NULL, 90, 0);
+}
+
+static void add_list_builtin_members(CompList *list, bool has_following_paren) {
+    int cf = has_following_paren ? 1 : 2;
+    complist_add(list, "add", LSP_COMPLETION_METHOD, "method add(item: T): unit", "Appends item to list", has_following_paren ? "add" : "add(${1:item})", cf, NULL, 90, 0);
+    complist_add(list, "get", LSP_COMPLETION_METHOD, "method get(index: int): T", "Gets item at index", has_following_paren ? "get" : "get(${1:index})", cf, NULL, 90, 0);
+    complist_add(list, "set", LSP_COMPLETION_METHOD, "method set(index: int, item: T): unit", "Sets item at index", has_following_paren ? "set" : "set(${1:index}, ${2:item})", cf, NULL, 90, 0);
+    complist_add(list, "len", LSP_COMPLETION_METHOD, "method len(): int", "Number of items in list", has_following_paren ? "len" : "len()", 1, NULL, 90, 0);
+    complist_add(list, "length", LSP_COMPLETION_FIELD, "let length: int", "Number of items in list", "length", 1, NULL, 90, 0);
+    complist_add(list, "clear", LSP_COMPLETION_METHOD, "method clear(): unit", "Removes all items", has_following_paren ? "clear" : "clear()", 1, NULL, 90, 0);
+    complist_add(list, "contains", LSP_COMPLETION_METHOD, "method contains(item: T): bool", "Checks if item exists in list", has_following_paren ? "contains" : "contains(${1:item})", cf, NULL, 90, 0);
+    complist_add(list, "map", LSP_COMPLETION_METHOD, "method map(fn: (T) -> U): List<U>", "Transforms list items", has_following_paren ? "map" : "map(${1:item} -> $0)", cf, NULL, 90, 0);
+    complist_add(list, "filter", LSP_COMPLETION_METHOD, "method filter(fn: (T) -> bool): List<T>", "Filters list items", has_following_paren ? "filter" : "filter(${1:item} -> $0)", cf, NULL, 90, 0);
+}
+
+static void add_scalar_builtin_members(CompList *list, bool has_following_paren) {
+    complist_add(list, "toString", LSP_COMPLETION_METHOD, "method toString(): string", "String representation", has_following_paren ? "toString" : "toString()", 1, NULL, 90, 0);
+    complist_add(list, "asString", LSP_COMPLETION_METHOD, "method asString(): string", "String representation", has_following_paren ? "asString" : "asString()", 1, NULL, 90, 0);
+}
+
+/* ── Decl & Scope Symbol Addition ─────────────────────────────────────────── */
+
+static void add_decl_member_symbols(CompList *list, const SnDecl *type_decl, bool has_following_paren) {
+    if (!type_decl) return;
+
+    for (size_t i = 0; i < type_decl->members.len; i++) {
+        const SnDecl *m = SN_LIST_AT(type_decl->members, const SnDecl, i);
+        if (!m || !m->name) continue;
+
+        LspCompletionKind kind = LSP_COMPLETION_FIELD;
+        char detail[256] = "";
+        char insert_text[256];
+        int insert_fmt = 1;
+
+        if (m->kind == SN_DECL_METHOD) {
             kind = LSP_COMPLETION_METHOD;
-            kind_str = "method";
-            base_score = (ctx == CTX_MEMBER) ? 85 : 80;
-            break;
-        case SN_DECL_FIELD:
-            kind = LSP_COMPLETION_FIELD;
-            kind_str = d->is_mutable ? "var field" : "let field";
-            base_score = (ctx == CTX_MEMBER) ? 85 : 75;
-            break;
-        case SN_DECL_CONST:
-            kind = LSP_COMPLETION_CONSTANT;
-            kind_str = "const";
-            break;
-        case SN_DECL_VARIANT:
-            kind = LSP_COMPLETION_ENUM_MEMBER;
-            kind_str = "enum variant";
-            break;
-        default:
-            break;
-    }
-
-    if (ctx == CTX_TYPE_POS && kind != LSP_COMPLETION_CLASS && kind != LSP_COMPLETION_STRUCT &&
-        kind != LSP_COMPLETION_INTERFACE && kind != LSP_COMPLETION_ENUM) {
-        return;
-    }
-
-    char detail[256];
-    snprintf(detail, sizeof(detail), "%s %s", kind_str, d->name);
-
-    char insert_text[256];
-    int insert_fmt = 1;
-    if ((kind == LSP_COMPLETION_FUNCTION || kind == LSP_COMPLETION_METHOD) && !has_following_paren) {
-        snprintf(insert_text, sizeof(insert_text), "%s($1)", d->name);
-        insert_fmt = 2;
-    } else {
-        snprintf(insert_text, sizeof(insert_text), "%s", d->name);
-    }
-
-    complist_add(list, d->name, kind, detail, NULL, insert_text, insert_fmt, NULL, base_score, type_bonus);
-
-    // If member access on a type, also add its members
-    if (d->members.len > 0) {
-        for (size_t i = 0; i < d->members.len; i++) {
-            const SnDecl *m = SN_LIST_AT(d->members, const SnDecl, i);
-            if (ctx == CTX_MEMBER || ctx == CTX_GENERAL) {
-                collect_decl_symbols(list, m, ctx, has_following_paren);
+            snprintf(detail, sizeof(detail), "method %s", m->name);
+            if (!has_following_paren) {
+                if (m->params.len > 0) {
+                    snprintf(insert_text, sizeof(insert_text), "%s($1)", m->name);
+                    insert_fmt = 2;
+                } else {
+                    snprintf(insert_text, sizeof(insert_text), "%s()", m->name);
+                }
+            } else {
+                snprintf(insert_text, sizeof(insert_text), "%s", m->name);
             }
+        } else if (m->kind == SN_DECL_FIELD) {
+            kind = LSP_COMPLETION_FIELD;
+            snprintf(detail, sizeof(detail), "%s %s", m->is_mutable ? "var" : "let", m->name);
+            snprintf(insert_text, sizeof(insert_text), "%s", m->name);
+        } else if (m->kind == SN_DECL_CONST) {
+            kind = LSP_COMPLETION_CONSTANT;
+            snprintf(detail, sizeof(detail), "const %s", m->name);
+            snprintf(insert_text, sizeof(insert_text), "%s", m->name);
+        } else {
+            snprintf(detail, sizeof(detail), "member %s", m->name);
+            snprintf(insert_text, sizeof(insert_text), "%s", m->name);
         }
-    }
-    if (d->variants.len > 0) {
-        for (size_t i = 0; i < d->variants.len; i++) {
-            const SnDecl *v = SN_LIST_AT(d->variants, const SnDecl, i);
-            collect_decl_symbols(list, v, ctx, has_following_paren);
-        }
+
+        complist_add(list, m->name, kind, detail, NULL, insert_text, insert_fmt, NULL, 90, 0);
     }
 }
 
-/* ── Cross-Package & Prelude Resolver Symbols ────────────────────────────── */
-
-static void collect_scope_symbols(CompList *list, SnScope *scope, ComplContext ctx, int base_score, bool has_following_paren) {
+static void add_scope_symbols(CompList *list, SnScope *scope, ComplContext ctx, int base_score, bool has_following_paren) {
     if (!scope || !scope->buckets) return;
+
     for (size_t b = 0; b < scope->nbuckets; b++) {
         for (SnSymbol *sym = scope->buckets[b]; sym; sym = sym->next) {
             if (!sym->name || !sym->name[0]) continue;
 
             LspCompletionKind kind = LSP_COMPLETION_VARIABLE;
-            const char *kind_str = "symbol";
+            char detail[256] = "";
             int type_bonus = 0;
+            int score = base_score;
 
             switch (sym->kind) {
                 case SN_SYM_TYPE:
                     kind = LSP_COMPLETION_CLASS;
-                    kind_str = "type";
+                    snprintf(detail, sizeof(detail), "type %s", sym->name);
                     type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
+                    if (ctx == CTX_TYPE_POS) score = 95;
                     break;
                 case SN_SYM_FUNC:
                     kind = LSP_COMPLETION_FUNCTION;
-                    kind_str = "func";
+                    snprintf(detail, sizeof(detail), "func %s", sym->name);
                     break;
                 case SN_SYM_METHOD:
                     kind = LSP_COMPLETION_METHOD;
-                    kind_str = "method";
+                    snprintf(detail, sizeof(detail), "method %s", sym->name);
                     break;
                 case SN_SYM_FIELD:
                     kind = LSP_COMPLETION_FIELD;
-                    kind_str = "field";
+                    snprintf(detail, sizeof(detail), "field %s", sym->name);
                     break;
                 case SN_SYM_CONST:
                     kind = LSP_COMPLETION_CONSTANT;
-                    kind_str = "const";
+                    snprintf(detail, sizeof(detail), "const %s", sym->name);
                     break;
                 case SN_SYM_VARIANT:
                     kind = LSP_COMPLETION_ENUM_MEMBER;
-                    kind_str = "variant";
+                    snprintf(detail, sizeof(detail), "variant %s", sym->name);
                     break;
                 case SN_SYM_PARAM:
                     kind = LSP_COMPLETION_VARIABLE;
-                    kind_str = "param";
+                    if (sym->value_type) {
+                        char ty_s[128];
+                        format_typerep_string(sym->value_type, ty_s, sizeof(ty_s));
+                        snprintf(detail, sizeof(detail), "param %s: %s", sym->name, ty_s);
+                    } else {
+                        snprintf(detail, sizeof(detail), "param %s", sym->name);
+                    }
+                    score = 95;
                     break;
                 case SN_SYM_LOCAL:
                     kind = LSP_COMPLETION_VARIABLE;
-                    kind_str = "local";
+                    if (sym->value_type) {
+                        char ty_s[128];
+                        format_typerep_string(sym->value_type, ty_s, sizeof(ty_s));
+                        snprintf(detail, sizeof(detail), "%s %s: %s", sym->is_mutable ? "var" : "let", sym->name, ty_s);
+                    } else {
+                        snprintf(detail, sizeof(detail), "%s %s", sym->is_mutable ? "var" : "let", sym->name);
+                    }
+                    score = 90;
                     break;
                 case SN_SYM_PACKAGE:
                     kind = LSP_COMPLETION_MODULE;
-                    kind_str = "package";
+                    snprintf(detail, sizeof(detail), "package %s", sym->name);
                     break;
                 default:
+                    snprintf(detail, sizeof(detail), "symbol %s", sym->name);
                     break;
             }
 
             if (ctx == CTX_TYPE_POS && sym->kind != SN_SYM_TYPE) {
                 continue;
             }
-
-            char detail[256];
-            snprintf(detail, sizeof(detail), "%s %s", kind_str, sym->name);
 
             char insert_text[256];
             int insert_fmt = 1;
@@ -737,7 +722,53 @@ static void collect_scope_symbols(CompList *list, SnScope *scope, ComplContext c
                 snprintf(insert_text, sizeof(insert_text), "%s", sym->name);
             }
 
-            complist_add(list, sym->name, kind, detail, NULL, insert_text, insert_fmt, NULL, base_score, type_bonus);
+            complist_add(list, sym->name, kind, detail, NULL, insert_text, insert_fmt, NULL, score, type_bonus);
+        }
+    }
+}
+
+/* ── Member Completion on Inferred Type ───────────────────────────────────── */
+
+static void add_members_for_typerep(CompList *list, const LspDocAnalysis *a, const SnTypeRep *ty, bool has_following_paren) {
+    if (!ty) return;
+
+    if (ty->tag == SN_T_ARRAY) {
+        add_array_builtin_members(list, has_following_paren);
+        return;
+    }
+    if (ty->tag == SN_T_STRING) {
+        add_string_builtin_members(list, has_following_paren);
+        return;
+    }
+    if (ty->tag == SN_T_INT || ty->tag == SN_T_LONG || ty->tag == SN_T_DOUBLE ||
+        ty->tag == SN_T_DECIMAL || ty->tag == SN_T_FLOAT || ty->tag == SN_T_BYTE || ty->tag == SN_T_BOOL) {
+        add_scalar_builtin_members(list, has_following_paren);
+        return;
+    }
+
+    if (ty->tag == SN_T_NAMED && ty->decl) {
+        const char *dname = ty->decl->name ? ty->decl->name : "";
+        if (strcmp(dname, "Option") == 0) {
+            add_option_builtin_members(list, has_following_paren);
+        } else if (strcmp(dname, "Result") == 0) {
+            add_result_builtin_members(list, has_following_paren);
+        } else if (strcmp(dname, "Map") == 0) {
+            add_map_builtin_members(list, has_following_paren);
+        } else if (strcmp(dname, "List") == 0) {
+            add_list_builtin_members(list, has_following_paren);
+        }
+
+        const SnDecl *decl = ty->decl->decl;
+        if (decl) {
+            add_decl_member_symbols(list, decl, has_following_paren);
+        }
+
+        // Look up member scope in resolver
+        for (SnTypeScopeEntry *te = a->resolver.type_scopes; te; te = te->next) {
+            if (te->type_decl && te->type_decl->name && ty->decl->name &&
+                strcmp(te->type_decl->name, ty->decl->name) == 0) {
+                add_scope_symbols(list, te->member_scope, CTX_MEMBER, 90, has_following_paren);
+            }
         }
     }
 }
@@ -767,139 +798,225 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
     CompList list;
     complist_init(&list);
 
-    // 1. In-scope parameters & local variables (highest priority)
-    if (ctx != CTX_MEMBER && ctx != CTX_DECORATOR && ctx != CTX_IMPORT_LINE) {
-        collect_scope_locals(&list, doc->text, pos.line, has_following_paren);
+    uint32_t cursor_offset = lsp_pos_to_offset(doc, pos);
+
+    SnDiagSink null_diag;
+    SnChecker checker;
+    if (a) {
+        sn_diag_init(&null_diag, a->path ? a->path : "", "", 0);
+        null_diag.out = NULL;
+        null_diag.quiet = 1;
+        sn_checker_init(&checker, (SnArena *)&a->arena, (SnInternTable *)&a->intern,
+                        &null_diag, (SnResolver *)&a->resolver, (SnTypeTable *)&a->types);
+    }
+    const SnDecl *enclosing_decl = NULL;
+    const SnDecl *enclosing_type = NULL;
+    SnScope *local_scope = a ? lsp_build_scope_at(a, &checker, cursor_offset, &enclosing_decl, &enclosing_type) : NULL;
+    if (a) {
+        checker.current_package = (a->unit.package && a->unit.package[0])
+            ? sn_intern_cstr((SnInternTable *)&a->intern, a->unit.package)
+            : sn_intern_cstr((SnInternTable *)&a->intern, "main");
+        checker.current_imports = &a->unit.imports;
+        checker.enclosing_type = enclosing_type;
     }
 
-    // 2. Current AST declarations in the active unit
-    if (a && a->has_ast) {
-        for (size_t i = 0; i < a->unit.decls.len; i++) {
-            const SnDecl *d = SN_LIST_AT(a->unit.decls, const SnDecl, i);
-            collect_decl_symbols(&list, d, ctx, has_following_paren);
-        }
-    }
+    if (ctx == CTX_MEMBER) {
+        // Semantic Member Completion
+        bool found_receiver = false;
 
-    // 3. Current package & imported symbols & prelude from resolver
-    if (a && a->has_resolved) {
-        const char *pkg_name = a->unit.package ? a->unit.package : "";
-        SnScope *pkg_scope = sn_resolver_package_scope(&a->resolver, pkg_name);
-        if (pkg_scope) {
-            collect_scope_symbols(&list, pkg_scope, ctx, 80, has_following_paren);
+        if (a && receiver_buf[0]) {
+            // 1. Check if receiver is `this`
+            if (strcmp(receiver_buf, "this") == 0 && enclosing_type) {
+                add_decl_member_symbols(&list, enclosing_type, has_following_paren);
+                found_receiver = true;
+            } else {
+                // 2. Infer receiver expression type semantically
+                SnTypeRep *recv_ty = lsp_infer_expr_type_at(a, &checker, local_scope, receiver_buf);
+                if (recv_ty && recv_ty->tag != SN_T_ERROR) {
+                    // Check if receiver is Option<T> and unwrapped access
+                    if (recv_ty->tag == SN_T_NAMED && recv_ty->decl &&
+                        strcmp(recv_ty->decl->name, "Option") == 0 &&
+                        recv_ty->nargs >= 1 && recv_ty->args && recv_ty->args[0]) {
+                        add_members_for_typerep(&list, a, recv_ty->args[0], has_following_paren);
+                    }
+                    add_members_for_typerep(&list, a, recv_ty, has_following_paren);
+                    found_receiver = true;
+                }
+            }
+
+            // 3. If receiver is a static type name (e.g. `User.` or `Option.`)
+            if (!found_receiver) {
+                for (SnTypeScopeEntry *te = a->resolver.type_scopes; te; te = te->next) {
+                    if (te->type_decl && te->type_decl->name && strcmp(te->type_decl->name, receiver_buf) == 0) {
+                        add_scope_symbols(&list, te->member_scope, CTX_MEMBER, 90, has_following_paren);
+                        found_receiver = true;
+                    }
+                }
+            }
+
+            // 4. If receiver is a package name (e.g. `math.` or `io.`)
+            if (!found_receiver) {
+                SnScope *pkg_scope = sn_resolver_package_scope(&a->resolver, receiver_buf);
+                if (pkg_scope) {
+                    add_scope_symbols(&list, pkg_scope, CTX_MEMBER, 85, has_following_paren);
+                    found_receiver = true;
+                }
+            }
+        }
+    } else {
+        // Non-member (General, Type, Decorator, Import) Completion
+
+        // 1. Semantic Local Variables & Parameters (highest priority 95 / 90)
+        if (local_scope && ctx != CTX_DECORATOR && ctx != CTX_IMPORT_LINE) {
+            add_scope_symbols(&list, local_scope, ctx, 90, has_following_paren);
         }
 
-        // Imports
-        for (size_t i = 0; i < a->unit.imports.len; i++) {
-            const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
-            SnScope *imp_scope = sn_resolver_package_scope(&a->resolver, imp);
-            if (imp_scope) {
-                collect_scope_symbols(&list, imp_scope, ctx, 75, has_following_paren);
+        // 2. Enclosing type members (if inside a class method)
+        if (enclosing_type && ctx == CTX_GENERAL) {
+            add_decl_member_symbols(&list, enclosing_type, has_following_paren);
+        }
+
+        // 3. Current AST declarations in active unit
+        if (a && a->has_ast) {
+            for (size_t i = 0; i < a->unit.decls.len; i++) {
+                const SnDecl *d = SN_LIST_AT(a->unit.decls, const SnDecl, i);
+                if (!d || !d->name) continue;
+                LspCompletionKind kind = (d->kind == SN_DECL_CLASS) ? LSP_COMPLETION_CLASS :
+                                         (d->kind == SN_DECL_STRUCT) ? LSP_COMPLETION_STRUCT :
+                                         (d->kind == SN_DECL_ENUM) ? LSP_COMPLETION_ENUM :
+                                         (d->kind == SN_DECL_INTERFACE) ? LSP_COMPLETION_INTERFACE :
+                                         (d->kind == SN_DECL_FUNC) ? LSP_COMPLETION_FUNCTION :
+                                         (d->kind == SN_DECL_CONST) ? LSP_COMPLETION_CONSTANT : LSP_COMPLETION_VARIABLE;
+                if (ctx == CTX_TYPE_POS && kind != LSP_COMPLETION_CLASS && kind != LSP_COMPLETION_STRUCT &&
+                    kind != LSP_COMPLETION_ENUM && kind != LSP_COMPLETION_INTERFACE) {
+                    continue;
+                }
+
+                char detail[256];
+                snprintf(detail, sizeof(detail), "decl %s", d->name);
+                char insert_text[256];
+                int insert_fmt = 1;
+                if (kind == LSP_COMPLETION_FUNCTION && !has_following_paren) {
+                    snprintf(insert_text, sizeof(insert_text), "%s($1)", d->name);
+                    insert_fmt = 2;
+                } else {
+                    snprintf(insert_text, sizeof(insert_text), "%s", d->name);
+                }
+                int score = (ctx == CTX_TYPE_POS) ? 95 : 80;
+                int type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
+                complist_add(&list, d->name, kind, detail, NULL, insert_text, insert_fmt, NULL, score, type_bonus);
             }
         }
 
-        // Prelude
-        if (a->resolver.prelude_scope) {
-            collect_scope_symbols(&list, a->resolver.prelude_scope, ctx, 70, has_following_paren);
-        }
+        // 4. Current package & imported symbols from resolver
+        if (a && a->has_resolved) {
+            const char *pkg_name = a->unit.package ? a->unit.package : "";
+            SnScope *pkg_scope = sn_resolver_package_scope(&a->resolver, pkg_name);
+            if (pkg_scope) {
+                add_scope_symbols(&list, pkg_scope, ctx, 80, has_following_paren);
+            }
 
-        // Symbols from all dependency / workspace packages (e.g. .snovalang/deps/**/*.snova)
-        for (SnPackageScopeEntry *pe = a->resolver.packages; pe; pe = pe->next) {
-            if (!pe->package_name || !pe->scope) continue;
-            if (pkg_name && strcmp(pe->package_name, pkg_name) == 0) continue;
-
-            bool in_imports = false;
             for (size_t i = 0; i < a->unit.imports.len; i++) {
                 const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
-                if (imp && strcmp(imp, pe->package_name) == 0) {
-                    in_imports = true;
-                    break;
+                SnScope *imp_scope = sn_resolver_package_scope(&a->resolver, imp);
+                if (imp_scope) {
+                    add_scope_symbols(&list, imp_scope, ctx, 75, has_following_paren);
                 }
             }
-            if (in_imports) continue;
 
-            for (size_t b = 0; b < pe->scope->nbuckets; b++) {
-                for (SnSymbol *sym = pe->scope->buckets[b]; sym; sym = sym->next) {
-                    if (!sym->name || !sym->name[0]) continue;
-                    if (sym->decl && sym->decl->vis != SN_VIS_PUBLIC && sym->decl->vis != SN_VIS_DEFAULT) continue;
+            if (a->resolver.prelude_scope) {
+                add_scope_symbols(&list, a->resolver.prelude_scope, ctx, 70, has_following_paren);
+            }
 
-                    LspCompletionKind kind = LSP_COMPLETION_VARIABLE;
-                    const char *kind_str = "symbol";
-                    int type_bonus = 0;
+            // Cross-package symbols from all dependency / workspace packages
+            for (SnPackageScopeEntry *pe = a->resolver.packages; pe; pe = pe->next) {
+                if (!pe->package_name || !pe->scope) continue;
+                if (pkg_name && strcmp(pe->package_name, pkg_name) == 0) continue;
 
-                    switch (sym->kind) {
-                        case SN_SYM_TYPE:
-                            kind = LSP_COMPLETION_CLASS;
-                            kind_str = "type";
-                            type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
-                            break;
-                        case SN_SYM_FUNC:
-                            kind = LSP_COMPLETION_FUNCTION;
-                            kind_str = "func";
-                            break;
-                        case SN_SYM_METHOD:
-                            kind = LSP_COMPLETION_METHOD;
-                            kind_str = "method";
-                            break;
-                        case SN_SYM_CONST:
-                            kind = LSP_COMPLETION_CONSTANT;
-                            kind_str = "const";
-                            break;
-                        case SN_SYM_VARIANT:
-                            kind = LSP_COMPLETION_ENUM_MEMBER;
-                            kind_str = "variant";
-                            break;
-                        default:
-                            continue;
+                bool in_imports = false;
+                for (size_t i = 0; i < a->unit.imports.len; i++) {
+                    const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
+                    if (imp && strcmp(imp, pe->package_name) == 0) {
+                        in_imports = true;
+                        break;
                     }
+                }
+                if (in_imports) continue;
 
-                    if (ctx == CTX_TYPE_POS && sym->kind != SN_SYM_TYPE) {
-                        continue;
+                for (size_t b = 0; b < pe->scope->nbuckets; b++) {
+                    for (SnSymbol *sym = pe->scope->buckets[b]; sym; sym = sym->next) {
+                        if (!sym->name || !sym->name[0]) continue;
+                        if (sym->decl && sym->decl->vis != SN_VIS_PUBLIC && sym->decl->vis != SN_VIS_DEFAULT) continue;
+
+                        LspCompletionKind kind = LSP_COMPLETION_VARIABLE;
+                        const char *kind_str = "symbol";
+                        int type_bonus = 0;
+
+                        switch (sym->kind) {
+                            case SN_SYM_TYPE:
+                                kind = LSP_COMPLETION_CLASS;
+                                kind_str = "type";
+                                type_bonus = (ctx == CTX_TYPE_POS) ? 30 : 0;
+                                break;
+                            case SN_SYM_FUNC:
+                                kind = LSP_COMPLETION_FUNCTION;
+                                kind_str = "func";
+                                break;
+                            case SN_SYM_METHOD:
+                                kind = LSP_COMPLETION_METHOD;
+                                kind_str = "method";
+                                break;
+                            case SN_SYM_CONST:
+                                kind = LSP_COMPLETION_CONSTANT;
+                                kind_str = "const";
+                                break;
+                            case SN_SYM_VARIANT:
+                                kind = LSP_COMPLETION_ENUM_MEMBER;
+                                kind_str = "variant";
+                                break;
+                            default:
+                                continue;
+                        }
+
+                        if (ctx == CTX_TYPE_POS && sym->kind != SN_SYM_TYPE) continue;
+
+                        char detail[512];
+                        snprintf(detail, sizeof(detail), "%s %s (from %s)", kind_str, sym->name, pe->package_name);
+
+                        char insert_text[256];
+                        int insert_fmt = 1;
+                        if ((sym->kind == SN_SYM_FUNC || sym->kind == SN_SYM_METHOD) && !has_following_paren) {
+                            snprintf(insert_text, sizeof(insert_text), "%s($1)", sym->name);
+                            insert_fmt = 2;
+                        } else {
+                            snprintf(insert_text, sizeof(insert_text), "%s", sym->name);
+                        }
+
+                        int score = (ctx == CTX_TYPE_POS) ? 90 : 65;
+                        complist_add(&list, sym->name, kind, detail, pe->package_name, insert_text, insert_fmt, pe->package_name, score, type_bonus);
                     }
+                }
+            }
 
-                    char detail[512];
-                    snprintf(detail, sizeof(detail), "%s %s (from %s)", kind_str, sym->name, pe->package_name);
-
-                    char insert_text[256];
-                    int insert_fmt = 1;
-                    if ((sym->kind == SN_SYM_FUNC || sym->kind == SN_SYM_METHOD) && !has_following_paren) {
-                        snprintf(insert_text, sizeof(insert_text), "%s($1)", sym->name);
-                        insert_fmt = 2;
-                    } else {
-                        snprintf(insert_text, sizeof(insert_text), "%s", sym->name);
-                    }
-
-                    complist_add(&list, sym->name, kind, detail, pe->package_name, insert_text, insert_fmt, pe->package_name, 70, type_bonus);
+            // Package modules for imports
+            for (SnPackageNode *pn = a->graph.nodes; pn; pn = pn->next) {
+                if (pn->name && pn->name[0]) {
+                    char detail[256];
+                    snprintf(detail, sizeof(detail), "package %s", pn->name);
+                    int base_pkg_score = (ctx == CTX_IMPORT_LINE) ? 90 : 60;
+                    complist_add(&list, pn->name, LSP_COMPLETION_MODULE, detail, "Snovalang package dependency", pn->name, 1, NULL, base_pkg_score, 0);
                 }
             }
         }
 
-        // Package modules recommendations (especially in import lines)
-        for (SnPackageNode *pn = a->graph.nodes; pn; pn = pn->next) {
-            if (pn->name && pn->name[0]) {
-                char detail[256];
-                snprintf(detail, sizeof(detail), "package %s", pn->name);
-                int base_pkg_score = (ctx == CTX_IMPORT_LINE) ? 90 : 60;
-                complist_add(&list, pn->name, LSP_COMPLETION_MODULE, detail, "Snovalang package dependency", pn->name, 1, NULL, base_pkg_score, 0);
-            }
-        }
-
-        // Type member scopes (when in member access)
-        if (ctx == CTX_MEMBER && receiver_buf[0]) {
-            for (SnTypeScopeEntry *te = a->resolver.type_scopes; te; te = te->next) {
-                if (te->type_decl && te->type_decl->name && strcmp(te->type_decl->name, receiver_buf) == 0) {
-                    collect_scope_symbols(&list, te->member_scope, ctx, 85, has_following_paren);
-                }
-            }
-        }
+        // Keywords, snippets, types, decorators
+        add_keywords_and_snippets(&list, ctx, has_following_paren);
     }
 
-    // 4. Keywords, snippets, types, decorators
-    add_keywords_and_snippets(&list, ctx, has_following_paren);
-
-    // 5. Rank and Sort using Gopls / Rust-Analyzer 3-tier algorithm
+    // Rank and Sort candidates
     rank_and_sort_candidates(&list, prefix_buf);
 
-    // 6. Build JSON-RPC response
+    // Build JSON-RPC response
     JsonBuilder jb;
     jb_init(&jb);
     jb_start_obj(&jb);
@@ -907,7 +1024,6 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
     jb_key(&jb, "items");
     jb_start_arr(&jb);
 
-    // Replacement range for prefix
     uint32_t start_col = pos.character >= (uint32_t)strlen(prefix_buf) ? pos.character - (uint32_t)strlen(prefix_buf) : 0;
     uint32_t end_col = pos.character;
 

@@ -48,6 +48,7 @@ struct LspDocAnalysis {
 
     SnArena arena;
     SnInternTable intern;
+    SnDiagSink diag;
     SnTokenVec tokens;
     SnUnit unit;
     
@@ -88,5 +89,9 @@ const SnDecl *lsp_find_decl_at(const LspDocAnalysis *a, uint32_t offset);
 const SnExpr *lsp_find_expr_at(const LspDocAnalysis *a, uint32_t offset);
 const SnStmt *lsp_find_stmt_at(const LspDocAnalysis *a, uint32_t offset);
 const SnSymbol *lsp_find_symbol_at(const LspDocAnalysis *a, const LspDocument *doc, uint32_t offset, const char **out_name);
+
+/* Scope & Semantic Type Inference helpers */
+SnScope *lsp_build_scope_at(const LspDocAnalysis *a, SnChecker *checker, uint32_t offset, const SnDecl **out_enclosing_decl, const SnDecl **out_enclosing_type);
+SnTypeRep *lsp_infer_expr_type_at(const LspDocAnalysis *a, SnChecker *checker, SnScope *local, const char *expr_str);
 
 #endif /* SNOVA_LSP_ANALYSIS_H */

@@ -13,6 +13,7 @@
 #include "lsp_hover.h"
 #include "lsp_definition.h"
 #include "lsp_symbols.h"
+#include "lsp_code_action.h"
 #include "json.h"
 
 #include <stdio.h>
@@ -174,6 +175,7 @@ int main(int argc, char **argv) {
             jb_kv_bool(&res, "hoverProvider", true);
             jb_kv_bool(&res, "definitionProvider", true);
             jb_kv_bool(&res, "documentSymbolProvider", true);
+            jb_kv_bool(&res, "codeActionProvider", true);
 
             jb_key(&res, "completionProvider");
             jb_start_obj(&res);
@@ -296,6 +298,32 @@ int main(int argc, char **argv) {
                 if (res_json) free(res_json);
             } else {
                 send_response(&transport, id, NULL, true);
+            }
+        } else if (strcmp(method, "textDocument/codeAction") == 0) {
+            const JsonVal *td = json_get_obj(params, "textDocument");
+            const JsonVal *range_obj = json_get_obj(params, "range");
+            const JsonVal *context = json_get_obj(params, "context");
+            const JsonVal *diags = context ? json_get_arr(context, "diagnostics") : NULL;
+            if (td && range_obj) {
+                const char *uri = json_get_str(td, "uri", "");
+                const JsonVal *start_obj = json_get_obj(range_obj, "start");
+                const JsonVal *end_obj = json_get_obj(range_obj, "end");
+                LspRange range = {
+                    .start = {
+                        .line = (uint32_t)(start_obj ? json_get_int(start_obj, "line", 0) : 0),
+                        .character = (uint32_t)(start_obj ? json_get_int(start_obj, "character", 0) : 0)
+                    },
+                    .end = {
+                        .line = (uint32_t)(end_obj ? json_get_int(end_obj, "line", 0) : 0),
+                        .character = (uint32_t)(end_obj ? json_get_int(end_obj, "character", 0) : 0)
+                    }
+                };
+                LspDocument *doc = lsp_docstore_get(&doc_store, uri);
+                char *res_json = lsp_code_action_query(&engine, &doc_store, doc, range, diags);
+                send_response(&transport, id, res_json, res_json == NULL);
+                if (res_json) free(res_json);
+            } else {
+                send_response(&transport, id, "[]", false);
             }
         } else if (strcmp(method, "shutdown") == 0) {
             send_response(&transport, id, NULL, true);
