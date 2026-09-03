@@ -13,9 +13,11 @@ INCLUDES = -Isrc -I$(SNOVAC_DIR)
 ifeq ($(OS),Windows_NT)
   EXE := .exe
   BIN_DIR := tools/bin
+  EXTRA_LIBS := -lws2_32
 else
   EXE :=
   BIN_DIR := $(BUILD)
+  EXTRA_LIBS := -lpthread
 endif
 
 BIN = $(BIN_DIR)/snova-lsp$(EXE)
@@ -52,10 +54,10 @@ $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(INCLUDES) -c -o $@ $<
 
 $(BIN): $(OBJS) $(SNOVAC_LIB) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(SNOVAC_CHECK_OBJ) $(SNOVAC_LIB)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(SNOVAC_CHECK_OBJ) $(SNOVAC_LIB) $(EXTRA_LIBS)
 
 $(TEST_BIN): tests/test_completion.c $(filter-out $(BUILD)/main.o,$(OBJS)) $(SNOVAC_LIB) | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(INCLUDES) -o $@ tests/test_completion.c $(filter-out $(BUILD)/main.o,$(OBJS)) $(SNOVAC_CHECK_OBJ) $(SNOVAC_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(INCLUDES) -o $@ tests/test_completion.c $(filter-out $(BUILD)/main.o,$(OBJS)) $(SNOVAC_CHECK_OBJ) $(SNOVAC_LIB) $(EXTRA_LIBS)
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

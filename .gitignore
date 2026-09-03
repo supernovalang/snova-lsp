@@ -1,5 +1,6 @@
 build/
 bin/
+tools/
 out/
 dist/
 node_modules/
@@ -7,3 +8,4 @@ node_modules/
 *.o
 *.d
 *.a
+*.exe

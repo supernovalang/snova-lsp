@@ -755,6 +755,55 @@ static SnScope *completion_import_scope(const LspDocAnalysis *a, const char *imp
     return NULL;
 }
 
+static bool import_covers_package(const LspDocAnalysis *a, const char *package_name) {
+    if (!a || !package_name || !package_name[0]) return false;
+    size_t package_len = strlen(package_name);
+    for (size_t i = 0; i < a->unit.imports.len; i++) {
+        const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
+        if (!imp) continue;
+        if (strcmp(imp, package_name) == 0 ||
+            (strncmp(imp, package_name, package_len) == 0 &&
+             imp[package_len] == '.')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Return the end of the package declaration line. Imports are inserted at
+ * this point so the existing blank line and import formatting remain intact. */
+static uint32_t package_line_end(const LspDocument *doc, const char *package_name,
+                                 const char **newline) {
+    if (!doc || !package_name) return UINT32_MAX;
+    const char *text = doc->text;
+    size_t offset = 0;
+    while (offset <= doc->text_len) {
+        size_t line_start = offset;
+        while (offset < doc->text_len && text[offset] != '\n' && text[offset] != '\r') offset++;
+        size_t line_end = offset;
+        while (line_start < line_end && (text[line_start] == ' ' || text[line_start] == '\t')) line_start++;
+        size_t package_len = strlen(package_name);
+        if (line_end - line_start >= 8 + package_len &&
+            strncmp(text + line_start, "package", 7) == 0 &&
+            (text[line_start + 7] == ' ' || text[line_start + 7] == '\t') &&
+            strncmp(text + line_start + 8, package_name, package_len) == 0) {
+            size_t after_name = line_start + 8 + package_len;
+            if (after_name == line_end || text[after_name] == ' ' || text[after_name] == '\t' ||
+                text[after_name] == ';') {
+                if (newline) *newline = "\n";
+                if (offset < doc->text_len && text[offset] == '\r') {
+                    if (newline) *newline = "\r\n";
+                }
+                return (uint32_t)offset;
+            }
+        }
+        if (offset >= doc->text_len) break;
+        if (text[offset] == '\r' && offset + 1 < doc->text_len && text[offset + 1] == '\n') offset++;
+        offset++;
+    }
+    return UINT32_MAX;
+}
+
 /* ── Member Completion on Inferred Type ───────────────────────────────────── */
 
 static void add_members_for_typerep(CompList *list, const LspDocAnalysis *a, const SnTypeRep *ty, bool has_following_paren) {
@@ -961,14 +1010,7 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
                 if (!pe->package_name || !pe->scope) continue;
                 if (pkg_name && strcmp(pe->package_name, pkg_name) == 0) continue;
 
-                bool in_imports = false;
-                for (size_t i = 0; i < a->unit.imports.len; i++) {
-                    const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
-                    if (imp && strcmp(imp, pe->package_name) == 0) {
-                        in_imports = true;
-                        break;
-                    }
-                }
+                bool in_imports = import_covers_package(a, pe->package_name);
                 if (in_imports) continue;
 
                 for (size_t b = 0; b < pe->scope->nbuckets; b++) {
@@ -1021,7 +1063,11 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
                         }
 
                         int score = (ctx == CTX_TYPE_POS) ? 90 : 65;
-                        complist_add(&list, sym->name, kind, detail, pe->package_name, insert_text, insert_fmt, pe->package_name, score, type_bonus);
+                        const char *needed_import = (ctx == CTX_IMPORT_LINE ||
+                                                     import_covers_package(a, pe->package_name))
+                            ? NULL : pe->package_name;
+                        complist_add(&list, sym->name, kind, detail, pe->package_name,
+                                     insert_text, insert_fmt, needed_import, score, type_bonus);
                     }
                 }
             }
@@ -1054,6 +1100,11 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
 
     uint32_t start_col = pos.character >= (uint32_t)strlen(prefix_buf) ? pos.character - (uint32_t)strlen(prefix_buf) : 0;
     uint32_t end_col = pos.character;
+    const char *package_name = (a && a->unit.package && a->unit.package[0]) ? a->unit.package : NULL;
+    const char *import_newline = "\n";
+    uint32_t package_end = package_line_end(doc, package_name, &import_newline);
+    LspPosition import_pos = {0, 0};
+    if (package_end != UINT32_MAX) import_pos = lsp_offset_to_pos(doc, package_end);
 
     for (size_t i = 0; i < list.len; i++) {
         const CompItem *ci = &list.items[i];
@@ -1098,6 +1149,32 @@ char *lsp_completion_query(LspAnalysisEngine *engine, LspDocStore *store, const 
         jb_end_obj(&jb);
         jb_kv_str(&jb, "newText", ci->insert_text ? ci->insert_text : ci->label);
         jb_end_obj(&jb);
+
+        if (ci->additional_import && package_end != UINT32_MAX) {
+            jb_key(&jb, "additionalTextEdits");
+            jb_start_arr(&jb);
+            jb_start_obj(&jb);
+            jb_key(&jb, "range");
+            jb_start_obj(&jb);
+            jb_key(&jb, "start");
+            jb_start_obj(&jb);
+            jb_kv_int(&jb, "line", import_pos.line);
+            jb_kv_int(&jb, "character", import_pos.character);
+            jb_end_obj(&jb);
+            jb_key(&jb, "end");
+            jb_start_obj(&jb);
+            jb_kv_int(&jb, "line", import_pos.line);
+            jb_kv_int(&jb, "character", import_pos.character);
+            jb_end_obj(&jb);
+            jb_end_obj(&jb);
+
+            char import_text[SNOVAC_PATH_MAX + 32];
+            snprintf(import_text, sizeof(import_text), "%simport %s%s",
+                     import_newline, ci->additional_import, import_newline);
+            jb_kv_str(&jb, "newText", import_text);
+            jb_end_obj(&jb);
+            jb_end_arr(&jb);
+        }
 
         jb_end_obj(&jb);
     }

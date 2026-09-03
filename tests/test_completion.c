@@ -215,17 +215,34 @@ static void test_decorator_ranking(void) {
 
 static void test_deps_recommendation(void) {
     // 1. Setup temporary workspace with .snovalang/deps/**/*.snova
+#if defined(_WIN32)
+    system("if exist C:\\tmp\\snova_lsp_deps_test rmdir /s /q C:\\tmp\\snova_lsp_deps_test");
+    system("mkdir C:\\tmp\\snova_lsp_deps_test");
+    system("mkdir C:\\tmp\\snova_lsp_deps_test\\.snovalang");
+    system("mkdir C:\\tmp\\snova_lsp_deps_test\\.snovalang\\deps");
+    system("mkdir C:\\tmp\\snova_lsp_deps_test\\.snovalang\\deps\\snova-remote");
+    system("mkdir C:\\tmp\\snova_lsp_deps_test\\.snovalang\\deps\\snova-remote\\src");
+    system("mkdir C:\\tmp\\snova_lsp_deps_test\\src");
+    const char *tmp_root = "C:/tmp/snova_lsp_deps_test";
+#else
     system("rm -rf /tmp/snova_lsp_deps_test");
     system("mkdir -p /tmp/snova_lsp_deps_test/.snovalang/deps/snova-remote/src");
     system("mkdir -p /tmp/snova_lsp_deps_test/src");
+    const char *tmp_root = "/tmp/snova_lsp_deps_test";
+#endif
 
-    FILE *f_manifest = fopen("/tmp/snova_lsp_deps_test/mod.sno", "w");
+    char manifest_path[512];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/mod.sno", tmp_root);
+    FILE *f_manifest = fopen(manifest_path, "w");
     if (f_manifest) {
         fprintf(f_manifest, "module app\n\nsnova \"1.0.0\"\n");
         fclose(f_manifest);
     }
 
-    FILE *f_dep = fopen("/tmp/snova_lsp_deps_test/.snovalang/deps/snova-remote/src/Remote.snova", "w");
+    char dependency_path[512];
+    snprintf(dependency_path, sizeof(dependency_path),
+             "%s/.snovalang/deps/snova-remote/src/Remote.snova", tmp_root);
+    FILE *f_dep = fopen(dependency_path, "w");
     if (f_dep) {
         fprintf(f_dep,
             "package Snova.Remote\n\n"
@@ -242,7 +259,7 @@ static void test_deps_recommendation(void) {
     lsp_docstore_init(&store);
 
     LspAnalysisEngine engine;
-    lsp_engine_init(&engine, "/tmp/snova_lsp_deps_test");
+    lsp_engine_init(&engine, tmp_root);
 
     const char *code =
         "package main\n"
@@ -251,7 +268,9 @@ static void test_deps_recommendation(void) {
         "    fetchRemote\n"
         "}\n";
 
-    LspDocument *doc = lsp_docstore_open(&store, "file:///tmp/snova_lsp_deps_test/src/App.snova", 1, code, strlen(code));
+    char app_uri[512];
+    snprintf(app_uri, sizeof(app_uri), "file:///%s/src/App.snova", tmp_root);
+    LspDocument *doc = lsp_docstore_open(&store, app_uri, 1, code, strlen(code));
     assert(doc != NULL);
 
     // Query completion after typing "fetchRemote"
@@ -277,6 +296,11 @@ static void test_deps_recommendation(void) {
             found_remote_func = true;
             const char *detail = json_get_str(item, "detail", "");
             assert(strstr(detail, "Snova.Remote") != NULL);
+            const JsonVal *edits = json_get_arr(item, "additionalTextEdits");
+            assert(edits != NULL);
+            assert(json_arr_len(edits) == 1);
+            const JsonVal *edit = json_arr_at(edits, 0);
+            assert(strcmp(json_get_str(edit, "newText", ""), "\nimport Snova.Remote\n") == 0);
             break;
         }
     }
@@ -292,7 +316,7 @@ static void test_deps_recommendation(void) {
         "func app(): unit {\n"
         "    let c: Remote\n"
         "}\n";
-    doc = lsp_docstore_open(&store, "file:///tmp/snova_lsp_deps_test/src/App.snova", 2, code2, strlen(code2));
+    doc = lsp_docstore_open(&store, app_uri, 2, code2, strlen(code2));
     assert(doc != NULL);
 
     LspPosition pos2 = { .line = 3, .character = 17 };
@@ -322,7 +346,11 @@ static void test_deps_recommendation(void) {
     lsp_engine_destroy(&engine);
     lsp_docstore_destroy(&store);
 
+#if defined(_WIN32)
+    system("if exist C:\\tmp\\snova_lsp_deps_test rmdir /s /q C:\\tmp\\snova_lsp_deps_test");
+#else
     system("rm -rf /tmp/snova_lsp_deps_test");
+#endif
     printf("✓ test_deps_recommendation passed\n");
 }
 

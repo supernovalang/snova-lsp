@@ -33,9 +33,19 @@ static void add_interpolation_tokens(TokenList *list, const LspDocument *doc,
             LspPosition delimiter = lsp_offset_to_pos(doc, tok->span.offset + (uint32_t)begin);
             add_token(list, delimiter.line, delimiter.character, 2, LSP_SEMANTIC_TYPE_OPERATOR);
             i += 2;
+            int in_string = 0;
             while (i < n && depth) {
-                if (s[i] == '{') depth++;
-                else if (s[i] == '}') depth--;
+                if (s[i] == '\\' && i + 1 < n) {
+                    i += 2;
+                    continue;
+                }
+                if (s[i] == '"') {
+                    in_string = !in_string;
+                    i++;
+                    continue;
+                }
+                if (!in_string && s[i] == '{') depth++;
+                else if (!in_string && s[i] == '}') depth--;
                 if (depth && (isalnum((unsigned char)s[i]) || s[i] == '_')) {
                     size_t id = i++;
                     while (i < n && (isalnum((unsigned char)s[i]) || s[i] == '_')) i++;
