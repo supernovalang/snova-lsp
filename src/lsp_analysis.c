@@ -276,7 +276,7 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
 const SnToken *lsp_find_token_at(const LspDocAnalysis *a, uint32_t offset) {
     if (!a || a->tokens.len == 0) return NULL;
     for (size_t i = 0; i < a->tokens.len; i++) {
-        const SnToken *tok = &a->tokens.items[i];
+        const SnToken *tok = &a->tokens.data[i];
         if (offset >= tok->span.offset && offset < tok->span.offset + tok->span.len) {
             return tok;
         }

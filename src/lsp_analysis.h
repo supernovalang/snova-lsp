@@ -17,6 +17,7 @@
 #include "package.h"
 #include "resolve.h"
 #include "check.h"
+#include "cmd_check.h"
 #include "project.h"
 #include "driver_utils.h"
 
