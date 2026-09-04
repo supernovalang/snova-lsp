@@ -11,6 +11,7 @@
 #include "lsp_analysis.h"
 #include "lsp_completion.h"
 #include "lsp_hover.h"
+#include "lsp_signature.h"
 #include "lsp_definition.h"
 #include "lsp_semantic.h"
 #include "lsp_references.h"
@@ -332,6 +333,7 @@ int main(int argc, char **argv) {
             jb_start_obj(&res);
             jb_kv_int(&res, "textDocumentSync", (int)LSP_SYNC_FULL);
             jb_kv_bool(&res, "hoverProvider", true);
+            jb_kv_bool(&res, "signatureHelpProvider", true);
             jb_kv_bool(&res, "definitionProvider", true);
             jb_kv_bool(&res, "referencesProvider", true);
             jb_kv_bool(&res, "implementationProvider", true);
@@ -480,6 +482,18 @@ int main(int argc, char **argv) {
             } else {
                 send_response(&transport, id, NULL, true);
             }
+        } else if (strcmp(method, "textDocument/signatureHelp") == 0) {
+            const JsonVal *td = json_get_obj(params, "textDocument");
+            const JsonVal *pos_obj = json_get_obj(params, "position");
+            if (td && pos_obj) {
+                const char *uri = json_get_str(td, "uri", "");
+                LspPosition pos = { (uint32_t)json_get_int(pos_obj, "line", 0),
+                                    (uint32_t)json_get_int(pos_obj, "character", 0) };
+                LspDocument *doc = lsp_docstore_get(&doc_store, uri);
+                char *res_json = lsp_signature_query(&engine, &doc_store, doc, pos);
+                send_response(&transport, id, res_json, res_json == NULL);
+                if (res_json) free(res_json);
+            } else send_response(&transport, id, NULL, true);
         } else if (strcmp(method, "textDocument/definition") == 0) {
             const JsonVal *td = json_get_obj(params, "textDocument");
             const JsonVal *pos_obj = json_get_obj(params, "position");

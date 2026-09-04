@@ -399,14 +399,72 @@ static void format_typerep_string(const SnTypeRep *ty, char *out, size_t out_sz)
             snprintf(out, out_sz, "%s", (ty->decl && ty->decl->name) ? ty->decl->name : "T");
             break;
         case SN_T_FUNC: {
-            char ret_str[64] = "unit";
-            if (ty->ret) format_typerep_string(ty->ret, ret_str, sizeof(ret_str));
-            snprintf(out, out_sz, "(...) -> %s", ret_str);
+            size_t used = (size_t)snprintf(out, out_sz, "(");
+            for (uint32_t i = 0; i < ty->nargs && used < out_sz; i++) {
+                char param_str[64];
+                format_typerep_string(ty->args[i], param_str, sizeof(param_str));
+                if (i) used += (size_t)snprintf(out + used, out_sz - used, ", ");
+                used += (size_t)snprintf(out + used, out_sz - used, "%s", param_str);
+            }
+            if (used < out_sz) {
+                char ret_str[64] = "unit";
+                if (ty->ret) format_typerep_string(ty->ret, ret_str, sizeof(ret_str));
+                snprintf(out + used, out_sz - used, ") -> %s", ret_str);
+            }
             break;
         }
         default:
             snprintf(out, out_sz, "any");
             break;
+    }
+}
+
+static void format_source_type(const SnType *type, char *out, size_t out_sz) {
+    if (!type) {
+        snprintf(out, out_sz, "any");
+    } else if (type->kind == SN_TYPE_NAME) {
+        snprintf(out, out_sz, "%s%s", type->name ? type->name : "any",
+                 type->is_optional ? "?" : "");
+    } else if (type->kind == SN_TYPE_FUNC) {
+        size_t used = (size_t)snprintf(out, out_sz, "(");
+        for (size_t i = 0; i < type->params.len && used < out_sz; i++) {
+            char param[64];
+            format_source_type(SN_LIST_AT(type->params, const SnType, i),
+                               param, sizeof(param));
+            if (i) used += (size_t)snprintf(out + used, out_sz - used, ", ");
+            used += (size_t)snprintf(out + used, out_sz - used, "%s", param);
+        }
+        if (used < out_sz) {
+            char ret[64];
+            format_source_type(type->ret, ret, sizeof(ret));
+            snprintf(out + used, out_sz - used, ") -> %s", ret);
+        }
+    } else {
+        snprintf(out, out_sz, "unknown");
+    }
+}
+
+static void format_decl_callable_detail(const SnDecl *decl, const char *kind,
+                                        char *out, size_t out_sz) {
+    if (!decl || !kind) {
+        snprintf(out, out_sz, "%s", kind ? kind : "callable");
+        return;
+    }
+
+    size_t used = (size_t)snprintf(out, out_sz, "%s %s(", kind,
+                                   decl->name ? decl->name : "");
+    for (size_t i = 0; i < decl->params.len && used < out_sz; i++) {
+        const SnParam *param = SN_LIST_AT(decl->params, const SnParam, i);
+        char type[96] = "any";
+        if (param && param->type) format_source_type(param->type, type, sizeof(type));
+        if (i) used += (size_t)snprintf(out + used, out_sz - used, ", ");
+        used += (size_t)snprintf(out + used, out_sz - used, "%s: %s",
+                                 param && param->name ? param->name : "_", type);
+    }
+    if (used < out_sz) {
+        char ret[96] = "unit";
+        if (decl->ret) format_source_type(decl->ret, ret, sizeof(ret));
+        snprintf(out + used, out_sz - used, "): %s", ret);
     }
 }
 
@@ -625,10 +683,41 @@ static void add_decl_member_symbols(CompList *list, const SnDecl *type_decl, boo
 
         if (m->kind == SN_DECL_METHOD) {
             kind = LSP_COMPLETION_METHOD;
-            snprintf(detail, sizeof(detail), "method %s", m->name);
+            size_t used = (size_t)snprintf(detail, sizeof(detail), "method %s", m->name);
+            if (m->generics.len > 0 && used < sizeof(detail)) {
+                used += (size_t)snprintf(detail + used, sizeof(detail) - used, "<");
+                for (size_t g = 0; g < m->generics.len && used < sizeof(detail); g++) {
+                    if (g) used += (size_t)snprintf(detail + used, sizeof(detail) - used, ", ");
+                    used += (size_t)snprintf(detail + used, sizeof(detail) - used, "%s",
+                                             (const char *)m->generics.items[g]);
+                }
+                if (used < sizeof(detail)) used += (size_t)snprintf(detail + used, sizeof(detail) - used, ">");
+            }
+            if (used < sizeof(detail)) used += (size_t)snprintf(detail + used, sizeof(detail) - used, "(");
+            for (size_t p = 0; p < m->params.len && used < sizeof(detail); p++) {
+                const SnParam *param = SN_LIST_AT(m->params, const SnParam, p);
+                if (p) used += (size_t)snprintf(detail + used, sizeof(detail) - used, ", ");
+                used += (size_t)snprintf(detail + used, sizeof(detail) - used, "%s: %s",
+                                         param && param->name ? param->name : "_",
+                                         param && param->type && param->type->name
+                                             ? param->type->name : "any");
+            }
+            if (used < sizeof(detail)) snprintf(detail + used, sizeof(detail) - used, ")");
             if (!has_following_paren) {
                 if (m->params.len > 0) {
-                    snprintf(insert_text, sizeof(insert_text), "%s($1)", m->name);
+                    size_t pos = (size_t)snprintf(insert_text, sizeof(insert_text), "%s(", m->name);
+                    for (size_t p = 0; p < m->params.len && pos + 8 < sizeof(insert_text); p++) {
+                        if (p) insert_text[pos++] = ',';
+                        insert_text[pos++] = ' ';
+                        pos += (size_t)snprintf(insert_text + pos, sizeof(insert_text) - pos,
+                                                "${%zu:%s}", p + 1,
+                                                SN_LIST_AT(m->params, SnParam, p)->name ?
+                                                SN_LIST_AT(m->params, SnParam, p)->name : "value");
+                    }
+                    if (pos + 3 < sizeof(insert_text)) {
+                        insert_text[pos++] = ')';
+                        insert_text[pos] = '\0';
+                    }
                     insert_fmt = 2;
                 } else {
                     snprintf(insert_text, sizeof(insert_text), "%s()", m->name);
@@ -674,11 +763,11 @@ static void add_scope_symbols(CompList *list, SnScope *scope, ComplContext ctx, 
                     break;
                 case SN_SYM_FUNC:
                     kind = LSP_COMPLETION_FUNCTION;
-                    snprintf(detail, sizeof(detail), "func %s", sym->name);
+                    format_decl_callable_detail(sym->decl, "func", detail, sizeof(detail));
                     break;
                 case SN_SYM_METHOD:
                     kind = LSP_COMPLETION_METHOD;
-                    snprintf(detail, sizeof(detail), "method %s", sym->name);
+                    format_decl_callable_detail(sym->decl, "method", detail, sizeof(detail));
                     break;
                 case SN_SYM_FIELD:
                     kind = LSP_COMPLETION_FIELD;

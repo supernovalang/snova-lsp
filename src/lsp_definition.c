@@ -3,6 +3,51 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+
+static const SnSymbol *find_member_reference(const LspDocAnalysis *a,
+                                             const LspDocument *doc,
+                                             const SnToken *tok, uint32_t offset) {
+    if (!a || !doc || !tok || tok->span.offset == 0) return NULL;
+    size_t p = tok->span.offset;
+    while (p > 0 && (doc->text[p - 1] == ' ' || doc->text[p - 1] == '\t')) p--;
+    if (p == 0 || doc->text[p - 1] != '.') return NULL;
+
+    size_t end = p - 1;
+    size_t start = end;
+    while (start > 0) {
+        char ch = doc->text[start - 1];
+        if (isalnum((unsigned char)ch) || ch == '_' || ch == '.') start--;
+        else break;
+    }
+    if (start == end) return NULL;
+
+    char receiver[512];
+    size_t len = end - start;
+    if (len >= sizeof(receiver)) return NULL;
+    memcpy(receiver, doc->text + start, len);
+    receiver[len] = '\0';
+
+    SnDiagSink sink;
+    sn_diag_init(&sink, a->path ? a->path : "", "", 0);
+    sink.out = NULL;
+    sink.quiet = 1;
+    SnChecker checker;
+    sn_checker_init(&checker, (SnArena *)&a->arena, (SnInternTable *)&a->intern,
+                    &sink, (SnResolver *)&a->resolver, (SnTypeTable *)&a->types);
+    SnScope *scope = lsp_build_scope_at(a, &checker, offset, NULL, NULL);
+    SnTypeRep *receiver_type = lsp_infer_expr_type_at(a, &checker, scope, receiver);
+    if (!receiver_type || receiver_type->tag != SN_T_NAMED || !receiver_type->decl ||
+        !receiver_type->decl->decl) return NULL;
+
+    const char *name = sn_intern_cstr((SnInternTable *)&a->intern, tok->text);
+    for (SnTypeScopeEntry *te = a->resolver.type_scopes; te; te = te->next) {
+        if (te->type_decl == receiver_type->decl->decl && te->member_scope) {
+            return sn_scope_lookup_local(te->member_scope, name);
+        }
+    }
+    return NULL;
+}
 
 char *lsp_definition_query(LspAnalysisEngine *engine, LspDocStore *store, const LspDocument *doc, LspPosition pos) {
     if (!doc) return NULL;
@@ -19,7 +64,8 @@ char *lsp_definition_query(LspAnalysisEngine *engine, LspDocStore *store, const 
     }
 
     const char *name = NULL;
-    const SnSymbol *sym = lsp_find_symbol_at(a, doc, offset, &name);
+    const SnSymbol *sym = find_member_reference(a, doc, tok, offset);
+    if (!sym) sym = lsp_find_symbol_at(a, doc, offset, &name);
 
     const char *target_path = NULL;
     SnSpan target_span = {0};

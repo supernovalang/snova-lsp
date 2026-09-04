@@ -25,7 +25,7 @@ TEST_BIN = $(BUILD)/test_completion$(EXE)
 
 SRCS = src/json.c src/lsp_transport.c src/lsp_document.c src/lsp_analysis.c \
        src/lsp_definition.c src/lsp_hover.c src/lsp_symbols.c src/lsp_completion.c \
-       src/lsp_code_action.c src/lsp_semantic.c src/lsp_references.c src/main.c
+       src/lsp_code_action.c src/lsp_semantic.c src/lsp_references.c src/lsp_signature.c src/main.c
 
 OBJS = $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
 

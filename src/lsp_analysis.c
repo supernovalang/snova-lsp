@@ -477,6 +477,24 @@ SnScope *lsp_build_scope_at(const LspDocAnalysis *a, SnChecker *checker, uint32_
     SnScope *scope = (SnScope *)sn_arena_alloc(checker->arena, sizeof(SnScope));
     sn_scope_init(scope, checker->arena, NULL);
 
+    if (enclosing_type) {
+        SnScope *members = sn_resolver_type_scope(&a->resolver, enclosing_type);
+        if (members) {
+            for (size_t i = 0; i < enclosing_type->members.len; i++) {
+                SnDecl *field = SN_LIST_AT(enclosing_type->members, SnDecl, i);
+                if (!field || (field->kind != SN_DECL_FIELD && field->kind != SN_DECL_CONST) ||
+                    !field->init) continue;
+                SnSymbol *sym = sn_scope_lookup_local(members,
+                    sn_intern_cstr((SnInternTable *)&a->intern, field->name));
+                if (sym && !sym->value_type) {
+                    sym->value_type = field->type
+                        ? sn_check_resolve_type(checker, field->type)
+                        : sn_check_expr(checker, NULL, field->init);
+                }
+            }
+        }
+    }
+
     if (!routine) {
         return scope;
     }

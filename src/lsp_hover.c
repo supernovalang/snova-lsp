@@ -13,8 +13,8 @@ static const char *get_keyword_doc(SnTokKind kind) {
         case SN_TOK_STRUCT: return "```snova\nstruct <Name> { ... }\n```\nDeclares a value type with fields and methods.";
         case SN_TOK_ENUM: return "```snova\nenum <Name> { Variant1, Variant2(T) }\n```\nDeclares an algebraic data type / tagged union.";
         case SN_TOK_INTERFACE: return "```snova\ninterface <Name> { ... }\n```\nDefines a contract of method signatures.";
-        case SN_TOK_FUNC: return "```snova\nfunc <name>(params): ReturnType { ... }\n```\nDeclares a top-level function.";
-        case SN_TOK_METHOD: return "```snova\nmethod <name>(params): ReturnType { ... }\n```\nDeclares a member method within a class, struct, or interface.";
+        case SN_TOK_FUNC: return "```snova\nfunc <name>(parameters): ReturnType { body }\n```\nDeclares a top-level function.";
+        case SN_TOK_METHOD: return "```snova\nmethod <name>(parameters): ReturnType { body }\n```\nDeclares a member method within a class, struct, or interface.";
         case SN_TOK_LET: return "```snova\nlet <name>[: Type] = <expr>\n```\nDeclares an immutable local binding or field.";
         case SN_TOK_VAR: return "```snova\nvar <name>[: Type] = <expr>\n```\nDeclares a mutable variable or field.";
         case SN_TOK_CONST: return "```snova\nconst <name>[: Type] = <expr>\n```\nDeclares a compile-time constant.";
@@ -48,10 +48,97 @@ static void format_type_repr(const SnType *t, char *buf, size_t buf_sz) {
     if (t->kind == SN_TYPE_NAME) {
         snprintf(buf, buf_sz, "%s%s", t->name ? t->name : "unknown", t->is_optional ? "?" : "");
     } else if (t->kind == SN_TYPE_FUNC) {
-        snprintf(buf, buf_sz, "(...) -> %s", t->ret ? (t->ret->name ? t->ret->name : "unit") : "unit");
+        size_t used = (size_t)snprintf(buf, buf_sz, "(");
+        for (size_t i = 0; i < t->params.len && used < buf_sz; i++) {
+            const SnType *param = SN_LIST_AT(t->params, const SnType, i);
+            char param_text[96];
+            format_type_repr(param, param_text, sizeof(param_text));
+            if (i) used += (size_t)snprintf(buf + used, buf_sz - used, ", ");
+            used += (size_t)snprintf(buf + used, buf_sz - used, "%s", param_text);
+        }
+        if (used < buf_sz) {
+            const char *ret = t->ret ? (t->ret->name ? t->ret->name : "unit") : "unit";
+            snprintf(buf + used, buf_sz - used, ") -> %s", ret);
+        }
     } else {
         snprintf(buf, buf_sz, "unknown");
     }
+}
+
+static void format_resolved_type(const SnTypeRep *t, char *buf, size_t buf_sz) {
+    if (!t) { snprintf(buf, buf_sz, "any"); return; }
+    switch (t->tag) {
+        case SN_T_INT: snprintf(buf, buf_sz, "int"); break;
+        case SN_T_LONG: snprintf(buf, buf_sz, "long"); break;
+        case SN_T_DOUBLE: snprintf(buf, buf_sz, "double"); break;
+        case SN_T_DECIMAL: snprintf(buf, buf_sz, "decimal"); break;
+        case SN_T_FLOAT: snprintf(buf, buf_sz, "float"); break;
+        case SN_T_BYTE: snprintf(buf, buf_sz, "byte"); break;
+        case SN_T_BOOL: snprintf(buf, buf_sz, "bool"); break;
+        case SN_T_STRING: snprintf(buf, buf_sz, "string"); break;
+        case SN_T_CHAR: snprintf(buf, buf_sz, "char"); break;
+        case SN_T_UNIT: snprintf(buf, buf_sz, "unit"); break;
+        case SN_T_ANY: snprintf(buf, buf_sz, "any"); break;
+        case SN_T_TYPEVAR: snprintf(buf, buf_sz, "%s", t->decl && t->decl->name ? t->decl->name : "T"); break;
+        case SN_T_NAMED: {
+            const char *name = t->decl && t->decl->name ? t->decl->name : "Type";
+            if (t->nargs == 0) snprintf(buf, buf_sz, "%s", name);
+            else {
+                size_t used = (size_t)snprintf(buf, buf_sz, "%s<", name);
+                for (uint32_t i = 0; i < t->nargs && used < buf_sz; i++) {
+                    if (i) used += (size_t)snprintf(buf + used, buf_sz - used, ", ");
+                    char arg[96]; format_resolved_type(t->args[i], arg, sizeof(arg));
+                    used += (size_t)snprintf(buf + used, buf_sz - used, "%s", arg);
+                }
+                if (used < buf_sz) snprintf(buf + used, buf_sz - used, ">");
+            }
+            break;
+        }
+        case SN_T_ARRAY: {
+            char elem[96]; format_resolved_type(t->nargs ? t->args[0] : NULL, elem, sizeof(elem));
+            snprintf(buf, buf_sz, "Array<%s>", elem);
+            break;
+        }
+        case SN_T_FUNC: {
+            size_t used = (size_t)snprintf(buf, buf_sz, "(");
+            for (uint32_t i = 0; i < t->nargs && used < buf_sz; i++) {
+                char param[96];
+                format_resolved_type(t->args[i], param, sizeof(param));
+                if (i) used += (size_t)snprintf(buf + used, buf_sz - used, ", ");
+                used += (size_t)snprintf(buf + used, buf_sz - used, "%s", param);
+            }
+            if (used < buf_sz) {
+                char ret[96];
+                format_resolved_type(t->ret, ret, sizeof(ret));
+                snprintf(buf + used, buf_sz - used, ") -> %s", ret);
+            }
+            break;
+        }
+        default: snprintf(buf, buf_sz, "any"); break;
+    }
+}
+
+static const SnSymbol *find_type_reference(const LspDocAnalysis *a, const SnToken *tok) {
+    if (!a || !tok || !tok->text) return NULL;
+    const char *name = sn_intern_cstr((SnInternTable *)&a->intern, tok->text);
+    SnScope *scope = sn_resolver_package_scope((SnResolver *)&a->resolver,
+                                                a->unit.package ? a->unit.package : "main");
+    if (scope) {
+        SnSymbol *sym = sn_scope_lookup_local(scope, name);
+        if (sym && sym->kind == SN_SYM_TYPE) return sym;
+    }
+    for (size_t i = 0; i < a->unit.imports.len; i++) {
+        const char *imp = SN_LIST_AT(a->unit.imports, const char, i);
+        SnScope *import_scope = sn_resolver_package_scope((SnResolver *)&a->resolver, imp);
+        if (!import_scope) continue;
+        SnSymbol *sym = sn_scope_lookup_local(import_scope, name);
+        if (sym && sym->kind == SN_SYM_TYPE) return sym;
+    }
+    if (a->resolver.prelude_scope) {
+        SnSymbol *sym = sn_scope_lookup_local(a->resolver.prelude_scope, name);
+        if (sym && sym->kind == SN_SYM_TYPE) return sym;
+    }
+    return NULL;
 }
 
 static void format_decl_signature(const SnDecl *d, char *out, size_t out_sz) {
@@ -83,13 +170,33 @@ static void format_decl_signature(const SnDecl *d, char *out, size_t out_sz) {
         case SN_DECL_FUNC: {
             char ret[64] = "unit";
             if (d->ret) format_type_repr(d->ret, ret, sizeof(ret));
-            snprintf(out, out_sz, "```snova\n%s%sfunc %s(...): %s\n```", vis, st, d->name ? d->name : "", ret);
+            char params[512] = "";
+            for (size_t i = 0; i < d->params.len; i++) {
+                const SnParam *p = SN_LIST_AT(d->params, const SnParam, i);
+                char pt[96] = "any";
+                if (p && p->type) format_type_repr(p->type, pt, sizeof(pt));
+                if (i) strncat(params, ", ", sizeof(params) - strlen(params) - 1);
+                char part[128];
+                snprintf(part, sizeof(part), "%s: %s", p && p->name ? p->name : "_", pt);
+                strncat(params, part, sizeof(params) - strlen(params) - 1);
+            }
+            snprintf(out, out_sz, "```snova\n%s%sfunc %s(%s): %s\n```", vis, st, d->name ? d->name : "", params, ret);
             break;
         }
         case SN_DECL_METHOD: {
             char ret[64] = "unit";
             if (d->ret) format_type_repr(d->ret, ret, sizeof(ret));
-            snprintf(out, out_sz, "```snova\n%s%smethod %s(...): %s\n```", vis, st, d->name ? d->name : "", ret);
+            char params[512] = "";
+            for (size_t i = 0; i < d->params.len; i++) {
+                const SnParam *p = SN_LIST_AT(d->params, const SnParam, i);
+                char pt[96] = "any";
+                if (p && p->type) format_type_repr(p->type, pt, sizeof(pt));
+                if (i) strncat(params, ", ", sizeof(params) - strlen(params) - 1);
+                char part[128];
+                snprintf(part, sizeof(part), "%s: %s", p && p->name ? p->name : "_", pt);
+                strncat(params, part, sizeof(params) - strlen(params) - 1);
+            }
+            snprintf(out, out_sz, "```snova\n%s%smethod %s(%s): %s\n```", vis, st, d->name ? d->name : "", params, ret);
             break;
         }
         case SN_DECL_FIELD: {
@@ -252,6 +359,12 @@ char *lsp_hover_query(LspAnalysisEngine *engine, const LspDocument *doc, LspPosi
         }
     }
 
+    // 3. Type references must prefer a type symbol over a same-named value/member.
+    const SnSymbol *type_sym = find_type_reference(a, tok);
+    if (type_sym && type_sym->decl) {
+        format_decl_signature(type_sym->decl, hover_text, sizeof(hover_text));
+    }
+
     // 3. Symbol lookup with doc comment extraction
     if (hover_text[0] == '\0') {
         const char *name = NULL;
@@ -263,7 +376,29 @@ char *lsp_hover_query(LspAnalysisEngine *engine, const LspDocument *doc, LspPosi
             extract_doc_comment(src, src_len, sym->decl->span.offset, hover_text, sizeof(hover_text));
         } else if (sym) {
             const char *kind_str = (sym->kind == SN_SYM_PARAM) ? "parameter" : "variable";
-            snprintf(hover_text, sizeof(hover_text), "```snova\n(%s) %s\n```", kind_str, sym->name ? sym->name : "");
+            const SnTypeRep *value_type = sym->value_type;
+            if (!value_type && (sym->kind == SN_SYM_LOCAL || sym->kind == SN_SYM_PARAM)) {
+                SnDiagSink null_diag;
+                sn_diag_init(&null_diag, a->path ? a->path : "", "", 0);
+                null_diag.out = NULL;
+                null_diag.quiet = 1;
+
+                SnChecker checker;
+                sn_checker_init(&checker, (SnArena *)&a->arena, (SnInternTable *)&a->intern,
+                                &null_diag, (SnResolver *)&a->resolver, (SnTypeTable *)&a->types);
+                SnScope *local_scope = lsp_build_scope_at(
+                    a, &checker, offset, NULL, NULL);
+                value_type = lsp_infer_expr_type_at(a, &checker, local_scope,
+                                                    sym->name);
+            }
+            if (value_type) {
+                char ty[128];
+                format_resolved_type(value_type, ty, sizeof(ty));
+                snprintf(hover_text, sizeof(hover_text), "```snova\n(%s) %s: %s\n```",
+                         kind_str, sym->name ? sym->name : "", ty);
+            } else {
+                snprintf(hover_text, sizeof(hover_text), "```snova\n(%s) %s\n```", kind_str, sym->name ? sym->name : "");
+            }
         }
     }
 
