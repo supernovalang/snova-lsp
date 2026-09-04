@@ -148,6 +148,13 @@ static void register_unit_decls_in_resolver(LspDocAnalysis *a) {
         if (!sym) {
             sym = sn_scope_define(pkg_scope, name, sk, d, d->span);
         }
+        if (sym && !sym->origin && a->path && a->path[0]) {
+            SnDiagFile *origin = (SnDiagFile *)sn_arena_alloc(&a->arena, sizeof(SnDiagFile));
+            origin->path = a->path;
+            origin->src = NULL;
+            origin->src_len = 0;
+            sym->origin = origin;
+        }
 
         if (has_members) {
             SnScope *ms = NULL;
@@ -172,8 +179,16 @@ static void register_unit_decls_in_resolver(LspDocAnalysis *a) {
                 if (!m || !m->name) continue;
                 const char *mname = sn_intern_cstr(&a->intern, m->name);
                 SnSymbolKind msk = (m->kind == SN_DECL_METHOD) ? SN_SYM_METHOD : SN_SYM_FIELD;
-                if (!sn_scope_lookup_local(ms, mname)) {
-                    sn_scope_define(ms, mname, msk, m, m->span);
+                SnSymbol *msym = sn_scope_lookup_local(ms, mname);
+                if (!msym) {
+                    msym = sn_scope_define(ms, mname, msk, m, m->span);
+                }
+                if (msym && !msym->origin && a->path && a->path[0]) {
+                    SnDiagFile *origin = (SnDiagFile *)sn_arena_alloc(&a->arena, sizeof(SnDiagFile));
+                    origin->path = a->path;
+                    origin->src = NULL;
+                    origin->src_len = 0;
+                    msym->origin = origin;
                 }
             }
         }
@@ -219,32 +234,49 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
     sn_resolver_init(&a->resolver, &a->arena, &a->intern, &a->diag, &a->graph, &a->types);
 
     // Scan project roots, .snovalang/deps, and builtins
+    SnProject ws_proj;
+    memset(&ws_proj, 0, sizeof(ws_proj));
+    if (engine->workspace_root[0]) {
+        project_discover(engine->workspace_root, &ws_proj);
+        if (ws_proj.has_manifest && ws_proj.source_root[0] && strcmp(ws_proj.source_root, "/") != 0) {
+            scan_project_roots(&a->graph, &ws_proj);
+        }
+    }
+
     SnProject proj;
     memset(&proj, 0, sizeof(proj));
     const char *scan_start = (a->path && a->path[0] && strcmp(a->path, "/") != 0) ? a->path : engine->workspace_root;
     if (scan_start && scan_start[0]) {
         project_discover(scan_start, &proj);
-        if (proj.has_manifest && proj.source_root[0] && strcmp(proj.source_root, "/") != 0) {
+        if (proj.has_manifest && proj.source_root[0] && strcmp(proj.source_root, "/") != 0 &&
+            (!ws_proj.has_manifest || strcmp(proj.source_root, ws_proj.source_root) != 0)) {
             scan_project_roots(&a->graph, &proj);
-        } else if (engine->workspace_root[0]) {
-            char ws_deps[SNOVAC_PATH_MAX + 32];
-            snprintf(ws_deps, sizeof(ws_deps), "%s/.snovalang/deps", engine->workspace_root);
-            if (path_is_dir(ws_deps)) {
-                sn_pkggraph_scan_root(&a->graph, ws_deps);
-            }
-            char ws_src[SNOVAC_PATH_MAX + 16];
-            snprintf(ws_src, sizeof(ws_src), "%s/src", engine->workspace_root);
-            if (path_is_dir(ws_src)) {
-                sn_pkggraph_scan_root(&a->graph, ws_src);
-            }
         }
+    }
+
+    // Always scan .snovalang/deps to ensure direct/indirect packages are complete
+    const char *deps_dir = NULL;
+    char ws_deps[SNOVAC_PATH_MAX + 32];
+    if (proj.deps_root[0] && path_is_dir(proj.deps_root)) {
+        deps_dir = proj.deps_root;
+    } else if (ws_proj.deps_root[0] && path_is_dir(ws_proj.deps_root)) {
+        deps_dir = ws_proj.deps_root;
+    } else if (engine->workspace_root[0]) {
+        snprintf(ws_deps, sizeof(ws_deps), "%s/.snovalang/deps", engine->workspace_root);
+        if (path_is_dir(ws_deps)) {
+            deps_dir = ws_deps;
+        }
+    }
+    if (deps_dir) {
+        sn_pkggraph_scan_root(&a->graph, deps_dir);
     }
 
     if (a->path && a->path[0] && path_is_file(a->path)) {
         sn_pkggraph_scan_single_file(&a->graph, a->path);
     }
 
-    const char *source_for_builtin = (proj.has_manifest && proj.source_root[0] && strcmp(proj.source_root, "/") != 0) ? proj.source_root : engine->workspace_root;
+    const char *source_for_builtin = (ws_proj.has_manifest && ws_proj.source_root[0]) ? ws_proj.source_root :
+                                     ((proj.has_manifest && proj.source_root[0]) ? proj.source_root : engine->workspace_root);
     char builtin_find[SNOVAC_PATH_MAX];
     if (engine->builtin_dir[0]) {
         sn_pkggraph_scan_root(&a->graph, engine->builtin_dir);
@@ -256,15 +288,22 @@ LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocSto
 
     sn_pkggraph_link(&a->graph);
 
+    SnList cycle;
+    memset(&cycle, 0, sizeof(cycle));
+    if (sn_pkggraph_find_cycle(&a->graph, &cycle)) {
+        report_import_cycle(&a->diag, &a->graph, &cycle);
+    }
+
     // 4. Resolve symbols & prelude
     sn_resolver_collect(&a->resolver);
     register_unit_decls_in_resolver(a);
     sn_resolver_build_prelude(&a->resolver);
     a->has_resolved = true;
 
-    // 5. Typecheck bodies
+    // 5. Typecheck bodies across the project
     sn_checker_init(&a->checker, &a->arena, &a->intern, &a->diag, &a->resolver, &a->types);
-    SnBodyCheckScope scope = { .own_prefix = a->path };
+    const char *check_prefix = source_for_builtin;
+    SnBodyCheckScope scope = { .own_prefix = check_prefix };
     check_all_bodies(&a->checker, &a->resolver, &a->graph, &a->arena, &scope);
 
     a->diag.quiet = 1;
@@ -742,4 +781,18 @@ LspDocAnalysis *lsp_engine_analyze_manifest(LspAnalysisEngine *engine, const Lsp
     a->next          = engine->analyses;
     engine->analyses = a;
     return a;
+}
+
+LspDocAnalysis *lsp_engine_analyze_workspace(LspAnalysisEngine *engine, LspDocStore *store) {
+    if (!engine || !engine->workspace_root[0]) return NULL;
+    char ws_uri[SNOVAC_PATH_MAX + 32];
+    snprintf(ws_uri, sizeof(ws_uri), "workspace://%s", engine->workspace_root);
+    LspDocument ws_doc;
+    memset(&ws_doc, 0, sizeof(ws_doc));
+    ws_doc.uri = ws_uri;
+    ws_doc.path = engine->workspace_root;
+    ws_doc.version = 0;
+    ws_doc.text = "";
+    ws_doc.text_len = 0;
+    return lsp_engine_analyze_document(engine, store, &ws_doc);
 }

@@ -82,6 +82,8 @@ char *lsp_semantic_tokens_query(LspAnalysisEngine *engine, const LspDocument *do
                 continue;
             }
             type = LSP_SEMANTIC_TYPE_STRING;
+        } else if (tok->kind == SN_TOK_THIS) {
+            type = LSP_SEMANTIC_TYPE_KEYWORD;
         } else if (tok->kind >= SN_TOK_PACKAGE && tok->kind <= SN_TOK_FALSE) {
             type = LSP_SEMANTIC_TYPE_KEYWORD;
         } else if (tok->kind == SN_TOK_INT || tok->kind == SN_TOK_LONG ||
@@ -89,7 +91,15 @@ char *lsp_semantic_tokens_query(LspAnalysisEngine *engine, const LspDocument *do
             type = LSP_SEMANTIC_TYPE_NUMBER;
         } else if (tok->kind == SN_TOK_FUNC || tok->kind == SN_TOK_METHOD) {
             type = LSP_SEMANTIC_TYPE_KEYWORD;
-        } else if (tok->kind != SN_TOK_IDENT) {
+        } else if (tok->kind == SN_TOK_IDENT) {
+            if (tok->text && isupper((unsigned char)tok->text[0])) {
+                type = LSP_SEMANTIC_TYPE_TYPE;
+            } else if (i + 1 < a->tokens.len && a->tokens.data[i + 1].kind == SN_TOK_LPAREN) {
+                type = LSP_SEMANTIC_TYPE_FUNCTION;
+            } else {
+                type = LSP_SEMANTIC_TYPE_VARIABLE;
+            }
+        } else {
             continue;
         }
         add_token(&list, p.line, p.character, tok->span.len, type);

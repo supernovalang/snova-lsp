@@ -24,6 +24,137 @@
 #include <stdbool.h>
 #include <inttypes.h>
 
+/* Emit diagnostics for a specific file path (may or may not be open in store).
+ * When the document is open, line offsets are used for precise conversion.
+ * For closed files, the compiler's 1-based line/col are converted directly. */
+static void emit_file_diagnostics(LspTransport *t, const char *file_uri,
+                                   const char *file_path, int version,
+                                   const LspDocument *doc_or_null,
+                                   const CapturedDiagList *diags,
+                                   size_t diag_count) {
+    JsonBuilder jb;
+    jb_init(&jb);
+    jb_start_obj(&jb);
+    jb_kv_str(&jb, "jsonrpc", "2.0");
+    jb_kv_str(&jb, "method", "textDocument/publishDiagnostics");
+
+    jb_key(&jb, "params");
+    jb_start_obj(&jb);
+    jb_kv_str(&jb, "uri", file_uri);
+    jb_kv_int(&jb, "version", version);
+
+    jb_key(&jb, "diagnostics");
+    jb_start_arr(&jb);
+
+    for (size_t i = 0; i < diag_count; i++) {
+        const CapturedDiag *cd = &diags->items[i];
+        if (cd->file_path && cd->file_path[0] && file_path &&
+            strcmp(cd->file_path, file_path) != 0) {
+            continue;
+        }
+
+        LspRange r;
+        if (doc_or_null) {
+            r = lsp_span_to_range(doc_or_null, cd->span.offset, cd->span.len,
+                                  cd->span.line, cd->span.col);
+        } else {
+            /* File not open — use compiler line/col (1-based → 0-based) */
+            uint32_t line0 = cd->span.line > 0 ? cd->span.line - 1 : 0;
+            uint32_t col0  = cd->span.col  > 0 ? cd->span.col  - 1 : 0;
+            uint32_t end_col = col0 + (cd->span.len > 0 ? cd->span.len : 1);
+            r.start.line      = line0;
+            r.start.character = col0;
+            r.end.line        = line0;
+            r.end.character   = end_col;
+        }
+
+        jb_start_obj(&jb);
+        jb_key(&jb, "range");
+        jb_start_obj(&jb);
+        jb_key(&jb, "start");
+        jb_start_obj(&jb);
+        jb_kv_int(&jb, "line", r.start.line);
+        jb_kv_int(&jb, "character", r.start.character);
+        jb_end_obj(&jb);
+        jb_key(&jb, "end");
+        jb_start_obj(&jb);
+        jb_kv_int(&jb, "line", r.end.line);
+        jb_kv_int(&jb, "character", r.end.character);
+        jb_end_obj(&jb);
+        jb_end_obj(&jb);
+
+        jb_kv_int(&jb, "severity",
+                  (int)(cd->level == SN_DIAG_WARNING ? LSP_SEVERITY_WARNING : LSP_SEVERITY_ERROR));
+        if (cd->code > 0) {
+            char code_str[32];
+            snprintf(code_str, sizeof(code_str), "SNOVA%04d", cd->code);
+            jb_kv_str(&jb, "code", code_str);
+        }
+        jb_kv_str(&jb, "source", "snovac");
+        jb_kv_str(&jb, "message", cd->message ? cd->message : "");
+        jb_end_obj(&jb);
+    }
+
+    jb_end_arr(&jb);
+    jb_end_obj(&jb);
+    jb_end_obj(&jb);
+
+    char *json_str = jb_take(&jb);
+    if (json_str) {
+        lsp_transport_write_message(t, json_str, strlen(json_str));
+        free(json_str);
+    }
+}
+
+/* Publish diagnostics for ALL files referenced in the analysis, not just the
+ * currently-open document.  This surfaces errors in closed project files in
+ * the IDE Problems panel, satisfying project-wide diagnostic reporting. */
+static void publish_all_diagnostics(LspTransport *t, LspDocStore *store,
+                                    const LspDocument *current_doc,
+                                    const LspDocAnalysis *a) {
+    if (!t || !a) return;
+
+    /* Collect distinct file paths from the diagnostic list */
+    #define MAX_DIAG_FILES 512
+    const char *seen_paths[MAX_DIAG_FILES];
+    size_t seen_count = 0;
+
+    /* Always ensure the current doc gets a publish (even with zero diags) */
+    if (current_doc && current_doc->path) {
+        seen_paths[seen_count++] = current_doc->path;
+        char *uri = current_doc->uri;
+        emit_file_diagnostics(t, uri, current_doc->path, current_doc->version,
+                              current_doc, &a->diags, a->diags.len);
+    }
+
+    for (size_t i = 0; i < a->diags.len; i++) {
+        const CapturedDiag *cd = &a->diags.items[i];
+        if (!cd->file_path || !cd->file_path[0]) continue;
+
+        /* Skip current_doc path (already published above) */
+        bool already = false;
+        for (size_t k = 0; k < seen_count; k++) {
+            if (strcmp(seen_paths[k], cd->file_path) == 0) { already = true; break; }
+        }
+        if (already) continue;
+        if (seen_count >= MAX_DIAG_FILES) break;
+        seen_paths[seen_count++] = cd->file_path;
+
+        /* Look up the document in the store (may be NULL if closed) */
+        LspDocument *file_doc = lsp_docstore_get_by_path(store, cd->file_path);
+        char *file_uri = file_doc ? file_doc->uri : lsp_path_to_uri(cd->file_path);
+        int  file_ver  = file_doc ? file_doc->version : 0;
+
+        if (file_uri) {
+            lsp_log(t, "[LSP OUT] textDocument/publishDiagnostics (project-wide) uri=%s", file_uri);
+            emit_file_diagnostics(t, file_uri, cd->file_path, file_ver,
+                                  file_doc, &a->diags, a->diags.len);
+            if (!file_doc) free(file_uri);
+        }
+    }
+    #undef MAX_DIAG_FILES
+}
+
 static void publish_diagnostics(LspTransport *t, const LspDocument *doc, const LspDocAnalysis *a) {
     if (!t || !doc || !a) return;
 
@@ -273,7 +404,10 @@ int main(int argc, char **argv) {
                         ? lsp_engine_analyze_manifest(&engine, doc)
                         : lsp_engine_analyze_document(&engine, &doc_store, doc);
                     if (a) {
-                        publish_diagnostics(&transport, doc, a);
+                        if (is_manifest)
+                            publish_diagnostics(&transport, doc, a);
+                        else
+                            publish_all_diagnostics(&transport, &doc_store, doc, a);
                     }
                 }
             }
@@ -300,7 +434,10 @@ int main(int argc, char **argv) {
                         ? lsp_engine_analyze_manifest(&engine, doc)
                         : lsp_engine_analyze_document(&engine, &doc_store, doc);
                     if (a) {
-                        publish_diagnostics(&transport, doc, a);
+                        if (is_manifest)
+                            publish_diagnostics(&transport, doc, a);
+                        else
+                            publish_all_diagnostics(&transport, &doc_store, doc, a);
                     }
                 }
             }

@@ -1,4 +1,5 @@
 #include "lsp_document.h"
+#include "driver_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,48 +20,54 @@ char *lsp_uri_to_path(const char *uri) {
     
     // URL decode into path
     size_t len = strlen(p);
-    char *path = (char *)malloc(len + 1);
-    if (!path) return NULL;
+    char *raw = (char *)malloc(len + 1);
+    if (!raw) return NULL;
     
     size_t w = 0;
     for (size_t i = 0; i < len; i++) {
         if (p[i] == '%' && i + 2 < len && isxdigit((unsigned char)p[i+1]) && isxdigit((unsigned char)p[i+2])) {
             char hex[3] = { p[i+1], p[i+2], '\0' };
-            path[w++] = (char)strtoul(hex, NULL, 16);
+            raw[w++] = (char)strtoul(hex, NULL, 16);
             i += 2;
         } else {
-            path[w++] = p[i];
+            raw[w++] = p[i];
         }
     }
-    path[w] = '\0';
-    return path;
+    raw[w] = '\0';
+
+    char norm[SNOVAC_PATH_MAX];
+    normalize_path_into(raw, norm, sizeof(norm));
+    free(raw);
+    return strdup(norm[0] ? norm : p);
 }
 
 char *lsp_path_to_uri(const char *path) {
-    if (!path) return NULL;
+    if (!path || !path[0]) return NULL;
     if (strncmp(path, "file://", 7) == 0) {
         return strdup(path);
     }
-    // file:// + encoded path
-    size_t len = strlen(path);
+    char norm[SNOVAC_PATH_MAX];
+    normalize_path_into(path, norm, sizeof(norm));
+    const char *p = norm[0] ? norm : path;
+    size_t len = strlen(p);
     char *uri = (char *)malloc(8 + len * 3 + 1);
     if (!uri) return NULL;
 
     strcpy(uri, "file://");
 #ifdef _WIN32
-    if (isalpha((unsigned char)path[0]) && path[1] == ':') {
+    if (isalpha((unsigned char)p[0]) && p[1] == ':') {
         strcat(uri, "/");
     }
 #else
-    if (path[0] != '/') {
+    if (p[0] != '/') {
         strcat(uri, "/");
     }
 #endif
 
     size_t w = strlen(uri);
     for (size_t i = 0; i < len; i++) {
-        char c = path[i];
-        if (isalnum((unsigned char)c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
+        char c = p[i];
+        if (isalnum((unsigned char)c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~' || c == ':') {
             uri[w++] = c;
         } else {
             sprintf(uri + w, "%%%02X", (unsigned char)c);
@@ -177,10 +184,17 @@ LspDocument *lsp_docstore_get(LspDocStore *store, const char *uri) {
 
 LspDocument *lsp_docstore_get_by_path(LspDocStore *store, const char *path) {
     if (!store || !path) return NULL;
+    char norm[SNOVAC_PATH_MAX];
+    normalize_path_into(path, norm, sizeof(norm));
     for (size_t i = 0; i < store->len; i++) {
-        if (store->docs[i]->path && strcmp(store->docs[i]->path, path) == 0) {
-            return store->docs[i];
-        }
+        if (!store->docs[i]->path) continue;
+        char doc_norm[SNOVAC_PATH_MAX];
+        normalize_path_into(store->docs[i]->path, doc_norm, sizeof(doc_norm));
+#ifdef _WIN32
+        if (strcasecmp(norm, doc_norm) == 0) return store->docs[i];
+#else
+        if (strcmp(norm, doc_norm) == 0) return store->docs[i];
+#endif
     }
     return NULL;
 }

@@ -77,6 +77,9 @@ void lsp_engine_set_workspace_root(LspAnalysisEngine *engine, const char *worksp
 /* Analyzes document, updates cache, and returns analysis snapshot. */
 LspDocAnalysis *lsp_engine_analyze_document(LspAnalysisEngine *engine, LspDocStore *store, const LspDocument *doc);
 
+/* Analyzes entire workspace and returns comprehensive project analysis snapshot. */
+LspDocAnalysis *lsp_engine_analyze_workspace(LspAnalysisEngine *engine, LspDocStore *store);
+
 /* Retrieves cached analysis */
 LspDocAnalysis *lsp_engine_get_analysis(LspAnalysisEngine *engine, const char *uri);
 
